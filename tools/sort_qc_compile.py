@@ -2058,28 +2058,30 @@ def compose_materials(plan: dict[str, Any], addon_dir: Path) -> tuple[list[dict[
     files: list[dict[str, Any]] = []
     vtfcmd = find_vtfcmd()
     if vtfcmd is None:
-        errors.append("VTFCmd.exe was not found; material VTF files were not generated.")
+        warnings.append("VTFCmd.exe was not found; material VTF files were not generated.")
     for row in plan.get("material_rows", []):
         if not isinstance(row, dict):
             continue
         material_name = safe_name(str(row.get("output_name") or row.get("material_name") or "material"), "material")
-        base_png = Path(str(row.get("base_png") or ""))
-        normal_png = Path(str(row.get("normal_png") or ""))
+        base_png_raw = str(row.get("base_png") or "").strip()
+        normal_png_raw = str(row.get("normal_png") or "").strip()
+        base_png = Path(base_png_raw)
+        normal_png = Path(normal_png_raw)
         base_vtf = out_dir / f"{material_name}.vtf"
         normal_vtf = out_dir / f"{material_name}_n.vtf"
         has_normal = False
         try:
-            if vtfcmd and base_png.exists():
+            if vtfcmd and base_png_raw and base_png.is_file():
                 converted = convert_one_vtf(vtfcmd, base_png, out_dir)
                 if converted != base_vtf and converted.exists():
                     converted.replace(base_vtf)
                 files.append(file_row(base_vtf, "material_vtf"))
-            elif not base_png.exists():
-                errors.append(f"Missing base PNG for material {material_name}: {base_png}")
+            elif not base_png_raw or not base_png.is_file():
+                warnings.append(f"Missing base PNG for material {material_name}: {base_png}")
         except Exception as exc:
-            errors.append(str(exc))
+            warnings.append(str(exc))
         try:
-            if vtfcmd and normal_png.exists() and normal_png.stat().st_size > 0:
+            if vtfcmd and normal_png_raw and normal_png.is_file() and normal_png.stat().st_size > 0:
                 converted = convert_one_vtf(vtfcmd, normal_png, out_dir)
                 if converted != normal_vtf and converted.exists():
                     converted.replace(normal_vtf)
@@ -2602,7 +2604,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         errors.append("Main or player-model .mdl output is missing from the final addon folder.")
     mat_dir = addon_dir / "materials" / "models" / author / model
     if not any(mat_dir.glob("*.vmt")):
-        errors.append("No material VMT files were written.")
+        warnings.append("No material VMT files were written.")
 
     distribution_output_dir = Path(str(plan.get("distribution_output_dir") or "")).expanduser()
     distribution_addon_dir = Path("")
@@ -2733,6 +2735,8 @@ def compose(plan_path: Path) -> dict[str, Any]:
     emit(f"Wrote final addon folder: {addon_dir}")
     if errors:
         emit("Step 14 completed with validation errors: " + "; ".join(errors))
+    elif warnings:
+        emit(f"Step 14 complete with warnings: {len(warnings)} warning(s).")
     else:
         emit("Step 14 complete.")
     return {"report": report, "files": files_payload}

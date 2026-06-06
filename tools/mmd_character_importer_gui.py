@@ -116,6 +116,85 @@ UPDATE_CHECK_TIMEOUT_SECONDS = 8
 UPDATE_OUTDATED_GRACE = timedelta(hours=1)
 
 
+def clean_path_text(raw: object) -> str:
+    text = str(raw or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return text
+
+
+def safe_resolve_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except Exception:
+        return path.expanduser().absolute()
+
+
+def resolve_gmod_path_input(raw: object) -> dict[str, object]:
+    text = clean_path_text(raw)
+    if not text:
+        return {"ok": False, "input": "", "error": "No GMod or StudioMDL path was entered."}
+    path = safe_resolve_path(Path(text))
+    if path.name.lower() == "studiomdl.exe":
+        if path.exists():
+            return {
+                "ok": True,
+                "input": text,
+                "display": str(path),
+                "kind": "studiomdl",
+                "gmod_root": "",
+                "studiomdl": str(path),
+            }
+        return {"ok": False, "input": text, "error": f"studiomdl.exe was not found: {path}"}
+    if path.is_dir():
+        install_studiomdl = path / "bin" / "studiomdl.exe"
+        if install_studiomdl.exists():
+            return {
+                "ok": True,
+                "input": text,
+                "display": str(path),
+                "kind": "install_root",
+                "gmod_root": str(path),
+                "studiomdl": "",
+            }
+        local_studiomdl = path / "studiomdl.exe"
+        if local_studiomdl.exists():
+            return {
+                "ok": True,
+                "input": text,
+                "display": str(local_studiomdl),
+                "kind": "studiomdl",
+                "gmod_root": "",
+                "studiomdl": str(local_studiomdl),
+            }
+        if path.name.lower() == "garrysmod":
+            sibling_studiomdl = path.parent / "bin" / "studiomdl.exe"
+            if sibling_studiomdl.exists():
+                return {
+                    "ok": True,
+                    "input": text,
+                    "display": str(path),
+                    "kind": "game_dir",
+                    "gmod_root": str(path),
+                    "studiomdl": "",
+                }
+        return {"ok": False, "input": text, "error": f"GMod install does not contain studiomdl.exe: {path}"}
+    return {"ok": False, "input": text, "error": f"GMod/StudioMDL path was not found: {path}"}
+
+
+def split_gmod_path_input(raw: object) -> tuple[str, str]:
+    resolved = resolve_gmod_path_input(raw)
+    if resolved.get("ok"):
+        return str(resolved.get("gmod_root") or ""), str(resolved.get("studiomdl") or "")
+    text = clean_path_text(raw)
+    if not text:
+        return "", ""
+    path = Path(text)
+    if path.name.lower() == "studiomdl.exe":
+        return "", text
+    return text, ""
+
+
 def sanitize_internal_identifier_text(value: object) -> str:
     return INTERNAL_IDENTIFIER_UNSAFE_RE.sub("", str(value or ""))
 
@@ -2023,13 +2102,7 @@ class FullImportWorker(QtCore.QThread):
             self._log("[Main Import] WARNING: " + warning)
 
     def _split_gmod_input(self) -> tuple[str, str]:
-        raw = self.gmod_path.strip()
-        if not raw:
-            return "", ""
-        path = Path(raw)
-        if path.name.lower() == "studiomdl.exe":
-            return "", str(path)
-        return str(path), ""
+        return split_gmod_path_input(self.gmod_path)
 
     def run(self) -> None:
         try:
@@ -2223,10 +2296,20 @@ class FullImportWorker(QtCore.QThread):
             if validation.get("ok") is False:
                 errors = validation.get("errors", []) if isinstance(validation.get("errors"), list) else []
                 raise RuntimeError("Step 14 QC compile failed validation: " + ("; ".join(str(item) for item in errors) or str(validation)))
+            qc_warnings = validation.get("warnings") if isinstance(validation.get("warnings"), list) else qc_result.report.get("warnings", [])
+            if isinstance(qc_warnings, list):
+                for warning in qc_warnings:
+                    text = str(warning)
+                    if text:
+                        labelled = f"Step 14 warning: {text}"
+                        if labelled not in self.optional_warnings:
+                            self.optional_warnings.append(labelled)
             self._write_marker(14, qc_result.qc_dir, outputs={"files": str(qc_result.files_path)}, report_path=qc_result.report_path, validation=validation or {"ok": True})
             self.step_results[14] = {"dir": str(qc_result.qc_dir), "report": str(qc_result.report_path), "files": str(qc_result.files_path)}
 
-            self.progress.emit(100, "Import Complete", str(qc_result.report.get("distribution_output_dir") or qc_result.report.get("addon_dir") or ""), "#2ea043")
+            completion_title = "Import Complete With Warnings" if self.optional_warnings else "Import Complete"
+            completion_color = "#d29922" if self.optional_warnings else "#2ea043"
+            self.progress.emit(100, completion_title, str(qc_result.report.get("distribution_output_dir") or qc_result.report.get("addon_dir") or ""), completion_color)
             self.done.emit(
                 {
                     "workspace": str(workspace.root),
@@ -2246,7 +2329,7 @@ class FullImportWorker(QtCore.QThread):
 
 
 class WorkspaceSizeWorker(QtCore.QThread):
-    done = QtCore.Signal(int, int)
+    done = QtCore.Signal(object, object)
     failed = QtCore.Signal(str)
 
     def __init__(self, root: Path) -> None:
@@ -8318,27 +8401,36 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 pass
         seen: set[Path] = set()
         for candidate in candidates:
-            try:
-                candidate = candidate.resolve()
-            except Exception:
-                candidate = candidate.absolute()
+            candidate = safe_resolve_path(candidate)
             if candidate in seen:
                 continue
             seen.add(candidate)
-            if candidate.name.lower() == "studiomdl.exe" and candidate.exists():
-                return str(candidate)
-            if candidate.is_dir() and (candidate / "bin" / "studiomdl.exe").exists():
-                return str(candidate)
+            resolved = resolve_gmod_path_input(str(candidate))
+            if resolved.get("ok"):
+                return str(resolved.get("display") or candidate)
         return ""
 
     def detect_gmod_for_main(self) -> None:
+        current = resolve_gmod_path_input(self.main_gmod_row.value() if hasattr(self, "main_gmod_row") else "")
+        if current.get("ok"):
+            found = str(current.get("display") or "")
+            self.main_gmod_row.set_value(found)
+            self.append_main_log(f"Using existing GMod StudioMDL/install path: {found}")
+            self.save_settings()
+            return
         found = self.find_gmod_candidate()
         if found:
             self.main_gmod_row.set_value(found)
             self.append_main_log(f"Detected GMod StudioMDL/install: {found}")
             self.save_settings()
             return
-        self.show_error("Detect GMod", "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL.")
+        detail = str(current.get("error") or "").strip()
+        if detail and self.main_gmod_row.value().strip():
+            detail = "\n\nCurrent path is not usable:\n" + detail
+        self.show_error(
+            "Detect GMod",
+            "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL." + detail,
+        )
 
     def update_main_display_placeholders(self, default_model: str = "") -> None:
         if hasattr(self, "main_category_display_edit"):
@@ -8444,12 +8536,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if not gmod:
             errors.append("Detect or browse to the GMod install/studiomdl.exe.")
         else:
-            path = Path(gmod)
-            if path.name.lower() == "studiomdl.exe":
-                if not path.exists():
-                    errors.append(f"studiomdl.exe was not found: {path}")
-            elif not (path / "bin" / "studiomdl.exe").exists():
-                errors.append(f"GMod install does not contain bin/studiomdl.exe: {path}")
+            resolved_gmod = resolve_gmod_path_input(gmod)
+            if not resolved_gmod.get("ok"):
+                errors.append(str(resolved_gmod.get("error") or "Invalid GMod install/studiomdl.exe path."))
         category = self.main_effective_category()
         model = self.main_effective_model_name()
         if category and not INTERNAL_IDENTIFIER_REQUIRED_RE.fullmatch(category):
@@ -8620,7 +8709,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_preflight_button.setEnabled(True)
         self.main_detect_gmod_button.setEnabled(True)
         self.main_cancel_button.setEnabled(False)
-        self.main_open_output_button.setEnabled(bool(result.get("distribution_output_dir")))
+        output_folder = str(result.get("distribution_output_dir") or result.get("addon_dir") or result.get("gmod_addon_dir") or "")
+        self.last_main_output_folder = output_folder
+        self.main_open_output_button.setEnabled(bool(output_folder and Path(output_folder).exists()))
         self.main_output_files = result.get("qc_files") if isinstance(result.get("qc_files"), dict) else {}
         self.populate_main_files_table(self.main_output_files.get("files", []) if self.main_output_files else [])
         warnings = result.get("optional_warnings") if isinstance(result.get("optional_warnings"), list) else []
@@ -8632,10 +8723,19 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.sync_main_results_to_step_tabs(result)
         self.refresh_workflow_statuses()
         self.refresh_workspace_cache_size()
-        distribution = str(result.get("distribution_output_dir") or "")
-        if distribution and Path(distribution).exists():
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(distribution))
-        QtWidgets.QMessageBox.information(self, "Import complete", "The model was imported, compiled, packaged, and copied to GMod addons.")
+        if output_folder and Path(output_folder).exists():
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(output_folder))
+        if warnings:
+            preview = "\n".join(f"- {warning}" for warning in warnings[:8])
+            if len(warnings) > 8:
+                preview += f"\n- ... {len(warnings) - 8} more"
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Import complete with warnings",
+                "The model was imported, compiled, and packaged, but some non-blocking issues were reported.\n\n" + preview,
+            )
+        else:
+            QtWidgets.QMessageBox.information(self, "Import complete", "The model was imported, compiled, packaged, and copied to GMod addons.")
 
     def full_import_failed(self, message: str) -> None:
         self.main_import_button.setEnabled(True)
@@ -8970,7 +9070,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_files_table.resizeRowsToContents()
 
     def open_main_output_folder(self) -> None:
-        output = str(self.settings_store.value("qc_gma_output_dir", "", str) or "")
+        output = str(getattr(self, "last_main_output_folder", "") or self.settings_store.value("qc_gma_output_dir", "", str) or "")
         if output and Path(output).exists():
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(output))
 
@@ -9189,7 +9289,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
             report_path=str(result.get("report", "")),
             validation={"ok": True},
         )
-        self.refresh_workspace_cache_size()
         QtWidgets.QMessageBox.information(self, "Import complete", "The PMX was imported and saved as a Blender file.")
 
     def import_failed(self, message: str) -> None:
@@ -14045,9 +14144,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
         worker.finished.connect(self.workspace_cache_size_finished)
         worker.start()
 
-    def workspace_cache_size_ready(self, size: int, folder_count: int) -> None:
-        self.workspace_cache_size_bytes = max(0, int(size))
-        self.workspace_cache_folder_count = max(0, int(folder_count))
+    def workspace_cache_size_ready(self, size: object, folder_count: object) -> None:
+        try:
+            self.workspace_cache_size_bytes = max(0, int(size))
+        except Exception:
+            self.workspace_cache_size_bytes = 0
+        try:
+            self.workspace_cache_folder_count = max(0, int(folder_count))
+        except Exception:
+            self.workspace_cache_folder_count = 0
         self.update_workspace_cache_size_label()
 
     def workspace_cache_size_failed(self, message: str) -> None:
@@ -16233,12 +16338,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
     def split_gmod_input_for_qc(self) -> tuple[str, str]:
         raw = self.qc_gmod_row.value().strip() if hasattr(self, "qc_gmod_row") else ""
-        if not raw:
-            return "", ""
-        path = Path(raw)
-        if path.is_file() or path.name.lower() == "studiomdl.exe":
-            return "", raw
-        return raw, ""
+        return split_gmod_path_input(raw)
 
     def on_qc_input_changed(self, value: str) -> None:
         self.current_qc_analysis = None
@@ -16339,6 +16439,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.show_error("Detect Step Outputs", "No Step 9 proportion export folder was found. Run Step 9 or browse to 2_proportion_export.")
 
     def detect_gmod_for_qc(self) -> None:
+        current = resolve_gmod_path_input(self.qc_gmod_row.value() if hasattr(self, "qc_gmod_row") else "")
+        if current.get("ok"):
+            found = str(current.get("display") or "")
+            self.qc_gmod_row.set_value(found)
+            self.append_qc_log(f"Using existing GMod StudioMDL/install path: {found}")
+            self.save_settings()
+            return
         candidates: list[Path] = []
         for key in ("STUDIOMDL", "GMOD_PATH"):
             raw = os.environ.get(key, "")
@@ -16364,22 +16471,24 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 pass
         seen: set[Path] = set()
         for candidate in candidates:
-            try:
-                candidate = candidate.resolve()
-            except Exception:
-                candidate = candidate.absolute()
+            candidate = safe_resolve_path(candidate)
             if candidate in seen:
                 continue
             seen.add(candidate)
-            if candidate.name.lower() == "studiomdl.exe" and candidate.exists():
-                self.qc_gmod_row.set_value(str(candidate))
-                self.append_qc_log(f"Detected StudioMDL: {candidate}")
+            resolved = resolve_gmod_path_input(str(candidate))
+            if resolved.get("ok"):
+                found = str(resolved.get("display") or candidate)
+                self.qc_gmod_row.set_value(found)
+                self.append_qc_log(f"Detected GMod StudioMDL/install: {found}")
+                self.save_settings()
                 return
-            if candidate.is_dir() and (candidate / "bin" / "studiomdl.exe").exists():
-                self.qc_gmod_row.set_value(str(candidate))
-                self.append_qc_log(f"Detected GMod install: {candidate}")
-                return
-        self.show_error("Detect GMod", "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL.")
+        detail = str(current.get("error") or "").strip()
+        if detail and self.qc_gmod_row.value().strip():
+            detail = "\n\nCurrent path is not usable:\n" + detail
+        self.show_error(
+            "Detect GMod",
+            "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL." + detail,
+        )
 
     def start_qc_analyze(self) -> None:
         if self.worker and self.worker.isRunning():
@@ -16812,8 +16921,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
         report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
         validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
         distribution_dir = str(report.get("distribution_output_dir") or "")
+        warnings = validation.get("warnings") if isinstance(validation.get("warnings"), list) else report.get("warnings", [])
+        warnings = [str(item) for item in warnings if item] if isinstance(warnings, list) else []
         if validation.get("ok"):
-            self.set_qc_progress(100, "Step 14 Complete", str(report.get("addon_dir", "")), "#2ea043")
+            self.set_qc_progress(
+                100,
+                "Step 14 Complete With Warnings" if warnings else "Step 14 Complete",
+                str(report.get("addon_dir", "")),
+                "#d29922" if warnings else "#2ea043",
+            )
             self.complete_step_from_result(
                 14,
                 result,
@@ -16825,7 +16941,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
             detail = "QC compile, GMA packaging, and addon folder composition completed."
             if distribution_dir:
                 detail += f"\n\nOutput folder:\n{distribution_dir}"
-            QtWidgets.QMessageBox.information(self, "Step 14 complete", detail)
+            if warnings:
+                preview = "\n".join(f"- {warning}" for warning in warnings[:8])
+                if len(warnings) > 8:
+                    preview += f"\n- ... {len(warnings) - 8} more"
+                QtWidgets.QMessageBox.warning(self, "Step 14 complete with warnings", detail + "\n\nWarnings:\n" + preview)
+            else:
+                QtWidgets.QMessageBox.information(self, "Step 14 complete", detail)
         else:
             errors = validation.get("errors", []) if isinstance(validation.get("errors"), list) else []
             self.set_qc_progress(100, "Step 14 Complete With Issues", f"{len(errors):,} validation issue(s)", "#d29922")

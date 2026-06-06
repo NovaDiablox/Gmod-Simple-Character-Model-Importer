@@ -26,6 +26,85 @@ TRACKING_PREFIXES = ("mci_mat_", "mci_final_")
 HELPER_MESH_NAMES = {"smd_bone_vis"}
 HEAD_HINTS = ("head", "face", "eye", "iris", "pupil", "mouth", "teeth", "tooth", "tongue", "nose", "brow", "lash", "eyelid", "blush")
 FACE_SCALE_HINTS = HEAD_HINTS + ("skin", "顔", "脸", "臉", "面", "目", "眼", "瞳", "口", "眉", "睫")
+FACIAL_MERGE_TEXT_HINTS = tuple(
+    dict.fromkeys(
+        HEAD_HINTS
+        + (
+            "surface",
+            "surfacel",
+            "surfacer",
+            "eyebrow",
+            "eyelash",
+            "eyelashes",
+            "tear",
+            "tears",
+            "expression",
+            "expressions",
+            "bloodline",
+            "tooth",
+            "teeth",
+            "顔",
+            "脸",
+            "臉",
+            "面",
+            "目",
+            "眼",
+            "瞳",
+            "口",
+            "眉",
+            "睫",
+            "涙",
+            "泪",
+        )
+    )
+)
+FACIAL_SHAPEKEY_TEXT_HINTS = (
+    "blink",
+    "wink",
+    "eye",
+    "eyes",
+    "pupil",
+    "stare",
+    "calm",
+    "hachu",
+    "horror",
+    "close",
+    "mouth",
+    "jaw",
+    "brow",
+    "eyebrow",
+    "smile",
+    "grin",
+    "surprised",
+    "blush",
+    "tear",
+    "tears",
+    "serious",
+    "sad",
+    "sadness",
+    "cheerful",
+    "anger",
+    "angry",
+    "tongue",
+    "lick",
+    "upper",
+    "lower",
+)
+FACIAL_SHAPEKEY_EXACT_NAMES = {
+    "a",
+    "i",
+    "u",
+    "e",
+    "o",
+    "ah",
+    "ch",
+    "oh",
+    "aa",
+    "ii",
+    "uu",
+    "ee",
+    "oo",
+}
 HAIR_HINTS = ("hair", "bang", "fringe", "liu_hai", "ponytail", "plait", "braid", "发", "髪")
 CLOTHES_HINTS = ("cloth", "dress", "skirt", "sleeve", "coat", "shirt", "jacket", "belt", "glove", "stocking", "shoe", "boot", "sock", "cape")
 BODY_HINTS = ("body", "skin", "surface", "torso", "arm", "leg", "hand", "foot", "neck")
@@ -582,6 +661,54 @@ def tracking_vertex_groups(obj: bpy.types.Object) -> list[dict[str, object]]:
     return out
 
 
+def shape_key_names(obj: bpy.types.Object) -> list[str]:
+    keys = obj.data.shape_keys
+    if keys is None:
+        return []
+    names: list[str] = []
+    for key in keys.key_blocks:
+        base = blender_base_name(str(key.name or "")).strip()
+        if not base or base.lower() == "basis":
+            continue
+        names.append(str(key.name))
+    return names
+
+
+def normalized_flex_name(name: str) -> str:
+    return re.sub(r"[\s_.\-]+", "", blender_base_name(str(name or "")).lower())
+
+
+def is_facial_shapekey_name(name: str) -> bool:
+    lowered = str(name or "").lower()
+    compact = normalized_flex_name(name)
+    if compact in FACIAL_SHAPEKEY_EXACT_NAMES:
+        return True
+    return any(hint in lowered or hint in compact for hint in FACIAL_SHAPEKEY_TEXT_HINTS)
+
+
+def facial_shapekey_names(obj: bpy.types.Object) -> list[str]:
+    return [name for name in shape_key_names(obj) if is_facial_shapekey_name(name)]
+
+
+def has_facial_merge_text_hint(
+    obj: bpy.types.Object,
+    materials: list[str],
+    tracking: list[dict[str, object]],
+) -> bool:
+    text = " ".join(
+        [
+            obj.name,
+            *materials,
+            *(str(entry.get("name") or "") for entry in tracking if isinstance(entry, dict)),
+        ]
+    ).lower()
+    return any(str(hint).lower() in text for hint in FACIAL_MERGE_TEXT_HINTS)
+
+
+def unique_sorted(values: Iterable[object]) -> list[str]:
+    return sorted({str(value) for value in values if str(value)}, key=natural_key)
+
+
 def connected_mesh_components(obj: bpy.types.Object, include_vertices: bool = False) -> list[dict[str, object]]:
     parent = list(range(len(obj.data.vertices)))
 
@@ -723,6 +850,15 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
         zero_alpha_materials = [name for name, alpha in material_alphas.items() if alpha <= 0.001]
         default_enabled = not zero_alpha_materials
         tracking = tracking_vertex_groups(obj)
+        shapekey_names = shape_key_names(obj)
+        facial_names = facial_shapekey_names(obj)
+        facial_text_hint = has_facial_merge_text_hint(obj, materials, tracking)
+        facial_merge_candidate = bool(default_enabled and (facial_names or facial_text_hint))
+        facial_merge_reasons: list[str] = []
+        if facial_names:
+            facial_merge_reasons.append("facial shapekeys")
+        if facial_text_hint:
+            facial_merge_reasons.append("face/head material or tracking hint")
         category, confidence, warnings = classify_source(obj, materials, tracking)
         components = component_summaries(obj, include_indices=True)
         component_count = len(components)
@@ -739,7 +875,12 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
         if component_count > 1 and tracking:
             warnings.append(f"Object has {component_count} disconnected components with tracking groups.")
         if default_enabled and len(obj.data.vertices) > vertex_limit:
-            warnings.append(f"Object exceeds Source's {vertex_limit:,} vertex limit and needs additional splitting.")
+            if facial_merge_candidate:
+                warnings.append(
+                    f"Face merge candidate exceeds Source's {vertex_limit:,} vertex limit; merged Face will fail validation if it remains over limit."
+                )
+            else:
+                warnings.append(f"Object exceeds Source's {vertex_limit:,} vertex limit and needs additional splitting.")
         mat = object_materials[0] if object_materials else (obj.active_material or (obj.data.materials[0] if obj.data.materials else None))
         texture_path = material_texture_path(mat)
         proposed = unique_name(default_bodygroup_name(category, obj.name), used_names, f"Bodygroup_{index:03d}")
@@ -761,6 +902,11 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
                 "component_count": component_count,
                 "components": components,
                 "related_vertex_groups": tracking,
+                "shapekey_names": shapekey_names,
+                "facial_shapekey_names": facial_names,
+                "facial_merge_candidate": facial_merge_candidate,
+                "facial_merge_text_hint": facial_text_hint,
+                "facial_merge_reasons": facial_merge_reasons,
                 "base_color_path": texture_path if not texture_path.startswith("packed:") else "",
                 "base_color_file": Path(texture_path).name if texture_path and not texture_path.startswith("packed:") else texture_path,
                 "preview_color": preview_color(uid, index, obj),
@@ -847,9 +993,95 @@ def build_bodygroups(sources: list[dict[str, object]]) -> list[dict[str, object]
     """Use the material-separated mesh objects as the default bodygroup rows."""
     used_names: set[str] = set()
     groups: list[dict[str, object]] = []
-    for index, source in enumerate(sorted(sources, key=lambda item: natural_key(item.get("proposed_name", item.get("uid", "")))), start=1):
+    sorted_sources = sorted(sources, key=lambda item: natural_key(item.get("proposed_name", item.get("uid", ""))))
+    face_sources = [
+        source
+        for source in sorted_sources
+        if source.get("default_enabled", True) and source.get("facial_merge_candidate", False)
+    ]
+    merged_source_uids = {str(source.get("uid") or "") for source in face_sources}
+    if face_sources:
+        face_name = unique_name("Face", used_names, "Face")
+        material_alphas: dict[str, float] = {}
+        warnings: set[str] = set()
+        for source in face_sources:
+            if isinstance(source.get("material_alphas"), dict):
+                material_alphas.update({str(key): float(value) for key, value in source["material_alphas"].items()})
+            warnings.update(str(warning) for warning in source.get("warnings", []) if warning)
+        if len(face_sources) > 1:
+            warnings.add(
+                f"Merged {len(face_sources)} face-related material sources into one Face bodygroup to keep facial flexes unified."
+            )
+        groups.append(
+            {
+                "uid": f"bg_{len(groups) + 1:03d}_{face_name.lower()[:36]}",
+                "enabled": True,
+                "proposed_name": face_name,
+                "source_uids": [str(source.get("uid") or "") for source in face_sources],
+                "source_objects": [
+                    str(object_name)
+                    for source in face_sources
+                    for object_name in source.get("object_names", [])
+                ],
+                "material_names": unique_sorted(
+                    material_name
+                    for source in face_sources
+                    for material_name in source.get("material_names", [])
+                ),
+                "material_alphas": material_alphas,
+                "zero_alpha_materials": unique_sorted(
+                    material_name
+                    for source in face_sources
+                    for material_name in source.get("zero_alpha_materials", [])
+                ),
+                "related_vertex_groups": unique_sorted(
+                    group["name"]
+                    for source in face_sources
+                    for group in source.get("related_vertex_groups", [])
+                    if isinstance(group, dict) and group.get("name")
+                ),
+                "category": "head",
+                "confidence": round(max(float(source.get("confidence", 0.0) or 0.0) for source in face_sources), 3),
+                "vertex_count": sum(int(source.get("vertex_count", 0) or 0) for source in face_sources),
+                "face_count": sum(int(source.get("face_count", 0) or 0) for source in face_sources),
+                "preview_color": face_sources[0].get("preview_color", [0.8, 0.8, 0.8, 1.0]),
+                "base_color_path": next((str(source.get("base_color_path") or "") for source in face_sources if source.get("base_color_path")), ""),
+                "base_color_file": next((str(source.get("base_color_file") or "") for source in face_sources if source.get("base_color_file")), ""),
+                "warnings": sorted(warnings, key=natural_key),
+                "facial_merge": True,
+                "merge_role": "face_flex",
+                "facial_merge_source_count": len(face_sources),
+                "facial_shapekey_names": unique_sorted(
+                    name
+                    for source in face_sources
+                    for name in source.get("facial_shapekey_names", [])
+                ),
+                "shapekey_names": unique_sorted(
+                    name
+                    for source in face_sources
+                    for name in source.get("shapekey_names", [])
+                ),
+                "source_categories": unique_sorted(source.get("category", "") for source in face_sources),
+                "facial_merge_sources": [
+                    {
+                        "uid": source.get("uid", ""),
+                        "object_names": list(source.get("object_names", [])),
+                        "material_names": list(source.get("material_names", [])),
+                        "facial_shapekey_names": list(source.get("facial_shapekey_names", [])),
+                        "reasons": list(source.get("facial_merge_reasons", [])),
+                    }
+                    for source in face_sources
+                ],
+            }
+        )
+    for source in sorted_sources:
+        if str(source.get("uid") or "") in merged_source_uids:
+            continue
         category = str(source.get("category") or "accessory")
-        base_name = str(source.get("proposed_name") or default_bodygroup_name(category, f"Bodygroup_{index:03d}"))
+        index = len(groups) + 1
+        source_object_names = list(source.get("object_names", []))
+        fallback_name = str(source_object_names[0]) if source_object_names else f"Bodygroup_{index:03d}"
+        base_name = default_bodygroup_name(category, fallback_name)
         name = unique_name(capitalized_bodygroup_name(base_name), used_names, f"Bodygroup_{index:03d}")
         enabled = bool(source.get("default_enabled", True))
         groups.append(
@@ -874,10 +1106,88 @@ def build_bodygroups(sources: list[dict[str, object]]) -> list[dict[str, object]
                 "preview_color": source.get("preview_color", [0.8, 0.8, 0.8, 1.0]),
                 "base_color_path": source.get("base_color_path", ""),
                 "base_color_file": source.get("base_color_file", ""),
+                "shapekey_names": list(source.get("shapekey_names", [])),
+                "facial_shapekey_names": list(source.get("facial_shapekey_names", [])),
+                "facial_merge_candidate": bool(source.get("facial_merge_candidate", False)),
                 "warnings": sorted({str(warning) for warning in source.get("warnings", []) if warning}, key=natural_key),
             }
         )
     return groups
+
+
+def build_facial_merge_report(
+    sources: list[dict[str, object]],
+    bodygroups: list[dict[str, object]],
+    vertex_limit: int,
+) -> dict[str, object]:
+    candidates = [
+        source
+        for source in sources
+        if source.get("default_enabled", True) and source.get("facial_merge_candidate", False)
+    ]
+    merged_group = next(
+        (
+            group
+            for group in bodygroups
+            if isinstance(group, dict) and group.get("enabled", True) and group.get("facial_merge")
+        ),
+        {},
+    )
+    warnings: list[str] = []
+    if not candidates:
+        warnings.append("No face-related material-separated sources were detected for merging.")
+    protected_over_limit = [
+        {
+            "uid": source.get("uid", ""),
+            "object_names": list(source.get("object_names", [])),
+            "vertex_count": int(source.get("vertex_count", 0) or 0),
+        }
+        for source in candidates
+        if int(source.get("vertex_count", 0) or 0) > vertex_limit
+    ]
+    if protected_over_limit:
+        warnings.append("One or more face merge sources exceed the vertex limit and were protected from automatic split.")
+    merged_vertex_count = int(merged_group.get("vertex_count", 0) or 0) if isinstance(merged_group, dict) else 0
+    if merged_vertex_count > vertex_limit:
+        warnings.append("Merged Face exceeds the vertex limit and will fail validation if applied unchanged.")
+    return {
+        "enabled": bool(candidates),
+        "merged": len(candidates) > 1,
+        "candidate_count": len(candidates),
+        "target_bodygroup": merged_group.get("proposed_name", "Face") if candidates else "",
+        "merged_vertex_count": merged_vertex_count,
+        "merged_over_vertex_limit": bool(merged_vertex_count > vertex_limit),
+        "source_uids": [str(source.get("uid") or "") for source in candidates],
+        "source_objects": [
+            str(object_name)
+            for source in candidates
+            for object_name in source.get("object_names", [])
+        ],
+        "materials": unique_sorted(
+            material_name
+            for source in candidates
+            for material_name in source.get("material_names", [])
+        ),
+        "facial_shapekey_names": unique_sorted(
+            name
+            for source in candidates
+            for name in source.get("facial_shapekey_names", [])
+        ),
+        "protected_over_limit_sources": protected_over_limit,
+        "sources": [
+            {
+                "uid": source.get("uid", ""),
+                "object_names": list(source.get("object_names", [])),
+                "material_names": list(source.get("material_names", [])),
+                "category": source.get("category", ""),
+                "vertex_count": int(source.get("vertex_count", 0) or 0),
+                "facial_shapekey_names": list(source.get("facial_shapekey_names", [])),
+                "reasons": list(source.get("facial_merge_reasons", [])),
+            }
+            for source in candidates
+        ],
+        "warnings": warnings,
+    }
 
 
 def auto_split_policy(sources: list[dict[str, object]], always_auto_split: bool, vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> dict[str, object]:
@@ -890,6 +1200,18 @@ def auto_split_policy(sources: list[dict[str, object]], always_auto_split: bool,
         }
         for source in sources
         if source.get("default_enabled", True) and int(source.get("vertex_count", 0) or 0) > vertex_limit
+        and not source.get("facial_merge_candidate", False)
+    ]
+    protected_face_over_limit = [
+        {
+            "uid": str(source.get("uid") or ""),
+            "name": str(source.get("proposed_name") or source.get("uid") or ""),
+            "object_names": list(source.get("object_names", [])),
+            "vertex_count": int(source.get("vertex_count", 0) or 0),
+        }
+        for source in sources
+        if source.get("default_enabled", True) and int(source.get("vertex_count", 0) or 0) > vertex_limit
+        and source.get("facial_merge_candidate", False)
     ]
     required = bool(always_auto_split or over_limit)
     if always_auto_split:
@@ -904,11 +1226,16 @@ def auto_split_policy(sources: list[dict[str, object]], always_auto_split: bool,
         "required": required,
         "reason": reason,
         "over_limit_sources": over_limit,
+        "protected_face_over_limit_sources": protected_face_over_limit,
     }
 
 
 def auto_split_sources(sources: list[dict[str, object]], policy: dict[str, object]) -> list[dict[str, object]]:
-    enabled_sources = [source for source in sources if source.get("default_enabled", True)]
+    enabled_sources = [
+        source
+        for source in sources
+        if source.get("default_enabled", True) and not source.get("facial_merge_candidate", False)
+    ]
     if policy.get("always"):
         return enabled_sources
     over_limit_uids = {str(entry.get("uid") or "") for entry in policy.get("over_limit_sources", []) if isinstance(entry, dict)}
@@ -1622,6 +1949,7 @@ def analyze_scene(
     metrics = scene_metrics()
     preview = collect_bodygroup_preview(sources)
     base_bodygroups = build_bodygroups(sources)
+    facial_merge = build_facial_merge_report(sources, base_bodygroups, vertex_limit)
     split_policy = auto_split_policy(sources, always_auto_split, vertex_limit)
     if split_policy.get("required"):
         split_candidates, clustering_status = detect_split_candidates(auto_split_sources(sources, split_policy), base_bodygroups, metrics)
@@ -1646,6 +1974,10 @@ def analyze_scene(
     clustering_warning = str(clustering_status.get("warning") or "")
     if clustering_warning:
         warnings.append(clustering_warning)
+    if facial_merge.get("protected_over_limit_sources") or facial_merge.get("merged_over_vertex_limit"):
+        warnings.append(
+            "Merged Face exceeds or contains sources over the Source vertex limit; Step 6 apply will fail validation instead of splitting facial flexes."
+        )
     analysis = {
         "version": 3,
         "kind": "sort_bodygroups",
@@ -1654,6 +1986,7 @@ def analyze_scene(
         "separation": separate_report,
         "shapekey_prune": shapekey_report,
         "auto_split": split_policy,
+        "facial_merge": facial_merge,
         "vertex_limit": vertex_limit,
         "source_count": len(sources),
         "bodygroup_count": len(bodygroups),
@@ -1676,6 +2009,7 @@ def analyze_scene(
         "scale_actual_factor": float(scale_report.get("actual_scale", 1.0) or 1.0),
         "vertex_limit": vertex_limit,
         "auto_split": split_policy,
+        "facial_merge": facial_merge,
         "bodygroups": bodygroups,
         "splits": plan_splits,
         "warnings": [],
@@ -2069,7 +2403,8 @@ def apply_plan(
         joined = join_objects(objects, name)
         if joined is None:
             continue
-        split_parts = split_oversized_bodygroup(joined, name, vertex_limit)
+        protected_face_merge = bool(group.get("facial_merge")) or str(group.get("merge_role") or "") == "face_flex"
+        split_parts = [joined] if protected_face_merge else split_oversized_bodygroup(joined, name, vertex_limit)
         for part_index, part in enumerate(split_parts, start=1):
             desired_name = name if part_index == 1 else f"{name}_{part_index:02d}"
             unavailable = output_names | (reserved_plan_names - {name})
@@ -2098,6 +2433,8 @@ def apply_plan(
                     ],
                     "auto_split_from": name if len(split_parts) > 1 else "",
                     "auto_split_part": part_index if len(split_parts) > 1 else 0,
+                    "facial_merge": protected_face_merge and part_index == 1,
+                    "merge_role": group.get("merge_role", "") if protected_face_merge and part_index == 1 else "",
                 }
             )
     for obj in list(mesh_objects()):
@@ -2115,6 +2452,12 @@ def apply_plan(
             validation_errors.append(f"Duplicate output bodygroup name {group_name!r}.")
         seen_group_names.add(group_name)
         if int(group.get("vertex_count", 0) or 0) > vertex_limit:
+            if group.get("facial_merge"):
+                validation_errors.append(
+                    f"{group.get('name')}: merged Face has {int(group.get('vertex_count', 0) or 0):,} vertices, "
+                    f"which exceeds Source's {vertex_limit:,} vertex limit. It was not split because that would duplicate facial flex controllers."
+                )
+                continue
             validation_errors.append(
                 f"{group.get('name')}: {int(group.get('vertex_count', 0) or 0):,} vertices exceeds Source's {vertex_limit:,} vertex limit."
             )
@@ -2127,6 +2470,7 @@ def apply_plan(
         "separation": analysis.get("separation", {}),
         "shapekey_prune": analysis.get("shapekey_prune", {}),
         "auto_split": analysis.get("auto_split", {}),
+        "facial_merge": plan.get("facial_merge", analysis.get("facial_merge", {})),
         "vertex_limit": vertex_limit,
         "advanced_clustering": analysis.get("advanced_clustering", {}),
         "split_report": split_report,
@@ -2168,10 +2512,13 @@ def validate_manual_bodygroups(
 
     seen_names: set[str] = set()
     output_groups: list[dict[str, object]] = []
+    facial_bodygroups: list[dict[str, object]] = []
     for obj in meshes:
         name = obj.name.strip()
         object_errors: list[str] = []
         object_warnings: list[str] = []
+        object_shapekeys = shape_key_names(obj)
+        object_facial_shapekeys = facial_shapekey_names(obj)
         if not SAFE_NAME_RE.fullmatch(name):
             object_errors.append(f"{name}: unsafe bodygroup object name.")
         if name in seen_names:
@@ -2191,6 +2538,12 @@ def validate_manual_bodygroups(
             object_warnings.append(f"{name}: mesh has no material slots.")
         if not any(group.name.startswith(TRACKING_PREFIXES) for group in obj.vertex_groups):
             object_warnings.append(f"{name}: mesh has no MCI tracking vertex groups.")
+        if object_facial_shapekeys:
+            facial_bodygroups.append({"name": name, "facial_shapekey_names": object_facial_shapekeys})
+            if name != "Face":
+                object_warnings.append(
+                    f"{name}: contains facial shapekeys and should usually be merged into Face to avoid duplicated flex controllers."
+                )
         if armature is not None:
             has_armature_modifier = any(
                 isinstance(modifier, bpy.types.ArmatureModifier) and modifier.object == armature
@@ -2206,6 +2559,8 @@ def validate_manual_bodygroups(
                 "vertex_count": vertex_count,
                 "face_count": face_count,
                 "materials": [mat.name for mat in obj.data.materials if mat is not None],
+                "shapekey_names": object_shapekeys,
+                "facial_shapekey_names": object_facial_shapekeys,
                 "vertex_group_count": len(obj.vertex_groups),
                 "tracking_vertex_groups": [group.name for group in obj.vertex_groups if group.name.startswith(TRACKING_PREFIXES)],
                 "armature_modifiers": [
@@ -2216,6 +2571,11 @@ def validate_manual_bodygroups(
                 "errors": object_errors,
                 "warnings": object_warnings,
             }
+        )
+    if len(facial_bodygroups) > 1 or any(str(item.get("name") or "") != "Face" for item in facial_bodygroups):
+        names = ", ".join(str(item.get("name") or "") for item in facial_bodygroups[:12])
+        warnings.append(
+            f"Multiple/manual bodygroups contain facial shapekeys ({names}); merge them into Face to avoid duplicated flex controllers."
         )
 
     report = {
@@ -2228,6 +2588,7 @@ def validate_manual_bodygroups(
         "ignored_helper_meshes": ignored_helper_meshes,
         "bodygroups": output_groups,
         "bodygroup_count": len(output_groups),
+        "facial_bodygroups": facial_bodygroups,
         "vertex_limit": vertex_limit,
         "validation": {"ok": not errors, "errors": errors, "warnings": warnings},
         "elapsed_seconds": round(time.monotonic() - started, 3),
