@@ -99,11 +99,17 @@ function Add-BinaryIfExists([string]$Path, [string]$Dest = ".") {
     }
 }
 
-function Invoke-NativeRelaxed([scriptblock]$Command) {
+function Invoke-NativeRelaxed([scriptblock]$Command, [switch]$CaptureOutput) {
     $PreviousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $Command
+        if ($CaptureOutput) {
+            $output = & $Command 2>&1
+            $script:LastNativeOutput = $output
+        }
+        else {
+            & $Command
+        }
         return $LASTEXITCODE
     }
     finally {
@@ -157,7 +163,7 @@ try {
     Add-RequiredData "tools" "tools"
     Add-RequiredData "plugins_software" "plugins_software"
     Add-RequiredData "external_tools" "external_tools"
-    Add-RequiredData "blender-4.5.10-windows-x64.zip" "."
+    Add-DataIfExists "blender-4.5.10-windows-x64.zip" "."
     Add-RequiredData "steps.txt" "."
     Add-RequiredData "Translation Templates Write.txt" "."
     Add-RequiredData "README.md" "."
@@ -329,8 +335,11 @@ try {
     $PyInstallerArgs += @("tools\mmd_character_importer_gui.py")
 
     Write-Host "Building $Name with PyInstaller..."
-    $PyInstallerBuildExitCode = Invoke-NativeRelaxed { & $Python -m PyInstaller @PyInstallerArgs }
+    $PyInstallerBuildExitCode = Invoke-NativeRelaxed { & $Python -m PyInstaller @PyInstallerArgs } -CaptureOutput
     if ($PyInstallerBuildExitCode -ne 0) {
+        if ($script:LastNativeOutput) {
+            Write-Host ($script:LastNativeOutput -join "`n")
+        }
         throw "PyInstaller build failed."
     }
     if ($OneDir) {
@@ -384,8 +393,8 @@ try {
         [ordered]@{
             name = "Blender"
             path = "blender-4.5.10-windows-x64.zip"
-            required = $true
-            role = "Portable Blender 4.5 setup fallback"
+            required = $false
+            role = "Portable Blender 4.5 setup fallback (optional; app can auto-download or use system Blender)"
         },
         [ordered]@{
             name = "VTFCmd"
@@ -426,7 +435,7 @@ try {
         notes = @(
             "Default builds are single-file executables. No _internal folder is required at runtime.",
             "Bundled tools/plugins/templates are extracted by PyInstaller to a temporary runtime folder when the executable starts.",
-            "First-time Blender setup still extracts and configures the bundled Blender zip in the user workspace.",
+            "Blender zip is optional. If not bundled, the app will auto-download or use a system-installed Blender.",
             "VTFCmd is bundled for VTF conversion. A separate VTFEdit/VTFCmd install is not required at runtime.",
             "A local Garry's Mod install is still required because StudioMDL and gmad are distributed with Garry's Mod."
         )
