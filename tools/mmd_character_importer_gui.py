@@ -9145,19 +9145,32 @@ class ImporterWindow(QtWidgets.QMainWindow):
             name = ", ".join(str(item) for item in display_names) or ", ".join(str(item) for item in manifest_ids) or str(model.get("addon_name") or "")
             modified_time = float(model.get("modified_time") or 0.0)
             modified_text = datetime.fromtimestamp(modified_time).strftime("%Y-%m-%d %H:%M") if modified_time > 0 else ""
+            size_bytes = int(model.get("size_bytes") or 0)
+
+            class _NumericRoleItem(QtWidgets.QTableWidgetItem):
+                def __lt__(self, other):  # type: ignore[override]
+                    try:
+                        return int(self.data(QtCore.Qt.ItemDataRole.UserRole + 1) or 0) < int(
+                            other.data(QtCore.Qt.ItemDataRole.UserRole + 1) or 0
+                        )
+                    except Exception:
+                        return super().__lt__(other)
+
             cells = [
                 name,
                 str(model.get("addon_name") or Path(str(model.get("addon_dir") or "")).name),
-                self.format_file_size(int(model.get("size_bytes") or 0)),
+                self.format_file_size(size_bytes),
                 modified_text,
                 ", ".join(str(item) for item in authors),
                 ", ".join(str(item) for item in categories),
                 "\n".join(str(item) for item in model_paths),
             ]
             for column, cell in enumerate(cells):
-                item = self.model_manager_item(cell, model if column == 0 else None)
                 if column == 2:
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, int(model.get("size_bytes") or 0))
+                    item = _NumericRoleItem(str(cell))
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, size_bytes)
+                else:
+                    item = self.model_manager_item(cell, model if column == 0 else None)
                 item.setToolTip(str(cell))
                 table.setItem(row, column, item)
         table.resizeColumnsToContents()
