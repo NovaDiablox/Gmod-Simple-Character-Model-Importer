@@ -2401,7 +2401,7 @@ class FullImportWorker(QtCore.QThread):
             collision_analysis = core.analyze_collision_blend(
                 flex_result.output_blend,
                 source_bodygroups=None,
-                quality_preset="balanced",
+                quality_preset="fast_preview",
                 progress=self._log,
                 cancel_check=self._cancelled,
             )

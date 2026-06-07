@@ -2828,9 +2828,8 @@ def write_raw_smd_triangle_chunk(path: Path, prefix: list[str], triangles: list[
 
 
 def split_smd_chunk_stems(stem: str, chunk_count: int, reserved: set[str]) -> list[str]:
-    stems = [stem]
-    reserved.add(stem.lower())
-    for index in range(2, chunk_count + 1):
+    stems: list[str] = []
+    for index in range(1, chunk_count + 1):
         base = f"{stem}_{index:02d}"
         candidate = base
         suffix = 2
@@ -2891,10 +2890,12 @@ def split_oversized_smds_for_compile(source_dir: Path, vertex_budget: int = SMD_
                     "raw_vertex_count": len(chunk) * 3,
                 }
             )
+        smd.unlink()
         report["splits"].append(
             {
                 "source": smd.name,
                 "backup": str(backup_path),
+                "removed_original": str(smd),
                 "original_triangle_count": len(triangles),
                 "original_raw_vertex_count": raw_vertex_count,
                 "chunk_count": len(chunks),
@@ -3348,21 +3349,28 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 emit("WARNING: " + warning)
                 carms_qc = refresh_compile_qcs()
                 continue
-            if not flex_compile_enabled and not oversized_smd_split_applied and is_too_many_verts_compile_failure(exc):
+            if not oversized_smd_split_applied and is_too_many_verts_compile_failure(exc):
                 split_report = split_oversized_smds_for_compile(source_dir)
                 split_rows = split_report.get("splits", [])
                 if split_rows:
                     oversized_smd_split_applied = True
                     oversized_smd_split_report = split_report
+                    if flex_compile_enabled and source_has_vta_files(source_dir):
+                        flex_compile_enabled = False
+                        flex_compile_disabled_reason = (
+                            f"StudioMDL rejected an oversized SMD while VTA files were present; "
+                            f"Step 14 disabled flex controllers before retrying split bodygroups. See {exc.log_path}"
+                        )
                     write_json(qc_dir / "oversized_smd_split_report.json", split_report)
                     split_summary = ", ".join(
                         f"{row.get('source')} -> {row.get('chunk_count')} chunks"
                         for row in split_rows
                         if isinstance(row, dict)
                     )
+                    flex_note = " Flex controllers are disabled for this compile." if not flex_compile_enabled else ""
                     warning = (
-                        "StudioMDL rejected an oversized SMD after flex fallback, so Step 14 split the oversized "
-                        f"mesh bodygroup(s) and retried: {split_summary}. Flex controllers remain disabled for this compile."
+                        "StudioMDL rejected an oversized SMD, so Step 14 split the oversized "
+                        f"mesh bodygroup(s) and retried: {split_summary}.{flex_note}"
                     )
                     warnings.append(warning)
                     emit("WARNING: " + warning)
