@@ -595,22 +595,25 @@ def import_raw_smds(raw_dir: Path) -> dict[str, object]:
 
 
 def import_raw_vtas(raw_dir: Path) -> list[dict[str, object]]:
-    imported: list[dict[str, object]] = []
-    for vta_path in sorted(raw_dir.glob("*.vta"), key=lambda path: path.name.lower()):
-        target = find_named_mesh(vta_path.stem)
-        if target is None:
-            imported.append({"file": vta_path.name, "target": vta_path.stem, "imported": False, "warning": "matching mesh was not found"})
-            log(f"Skipping raw VTA {vta_path.name}; matching mesh {vta_path.stem} was not found.")
-            continue
-        log(f"Importing raw VTA {vta_path.name} onto {target.name}")
-        set_active_only(target)
-        try:
-            result = bpy.ops.import_scene.smd(filepath=str(vta_path), append="VALIDATE", upAxis="Z")
-            imported.append({"file": vta_path.name, "target": target.name, "imported": result == {"FINISHED"}})
-        except Exception as exc:
-            imported.append({"file": vta_path.name, "target": target.name, "imported": False, "warning": str(exc)})
-            log(f"VTA import warning for {vta_path.name}: {exc}")
-    return imported
+    raw_vtas = sorted(raw_dir.glob("*.vta"), key=lambda path: path.name.lower())
+    if not raw_vtas:
+        log("No raw VTA files were exported; skipping VTA import into the proportion workspace.")
+        return []
+    log(
+        "Skipping raw VTA import into Blender; "
+        f"{len(raw_vtas)} raw VTA file(s) will be copied into the final proportion export."
+    )
+    return [
+        {
+            "file": path.name,
+            "target": path.stem,
+            "imported": False,
+            "skipped": True,
+            "copy_to_final": True,
+            "reason": "raw VTA is not needed for the proportion trick; final export uses the copied raw VTA",
+        }
+        for path in raw_vtas
+    ]
 
 
 def run_proportion_text_block() -> None:
@@ -854,7 +857,7 @@ def run_fresh_session_verification(processed_blend: Path, workspace_dir: Path) -
 
 
 def replace_final_vtas(raw_dir: Path, final_dir: Path) -> list[dict[str, object]]:
-    log("Replacing final VTA files with raw VTA files where available.")
+    log("Copying raw VTA files into the final proportion export.")
     actions: list[dict[str, object]] = []
     raw_vtas = {
         path.name: path
@@ -871,7 +874,7 @@ def replace_final_vtas(raw_dir: Path, final_dir: Path) -> list[dict[str, object]
         final = final_dir / name
         final.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(raw, final)
-        actions.append({"file": name, "action": "raw_vta_replaced", "raw_path": str(raw), "final_path": str(final)})
+        actions.append({"file": name, "action": "raw_vta_copied", "raw_path": str(raw), "final_path": str(final)})
     if not keep_names:
         actions.append({"file": "", "action": "none", "warning": "no raw VTA files were exported"})
     return actions
@@ -881,7 +884,7 @@ def file_inventory(final_dir: Path, vta_actions: list[dict[str, object]]) -> lis
     stage_by_name = {
         str(action.get("file")): str(action.get("action"))
         for action in vta_actions
-        if str(action.get("action")) in {"raw_vta_replaced", "kept_final"}
+        if str(action.get("action")) in {"raw_vta_copied", "raw_vta_replaced", "kept_final"}
     }
     warning_by_name = {
         str(action.get("file")): str(action.get("warning") or "")
@@ -902,7 +905,7 @@ def file_inventory(final_dir: Path, vta_actions: list[dict[str, object]]) -> lis
                 "path": str(path),
                 "type": suffix.upper(),
                 "size": path.stat().st_size,
-                "source_stage": "raw_vta_replaced" if stage_by_name.get(path.name) == "raw_vta_replaced" else "proportion",
+                "source_stage": "raw_vta_copied" if stage_by_name.get(path.name) in {"raw_vta_copied", "raw_vta_replaced"} else "proportion",
                 "warnings": warning_by_name.get(path.name, ""),
             }
         )

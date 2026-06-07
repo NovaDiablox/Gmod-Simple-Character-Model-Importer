@@ -210,9 +210,11 @@ def is_safe_bone_name(name: str) -> bool:
     return bool(SAFE_BONE_NAME_PATTERN.fullmatch(name) or SOURCE_BONE_NAME_PATTERN.fullmatch(name))
 
 
-def vertex_group_weight_totals() -> dict[str, float]:
+def vertex_group_weight_totals_by_mesh() -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     totals: dict[str, float] = defaultdict(float)
+    by_mesh: dict[str, dict[str, float]] = {}
     for obj in mesh_objects():
+        mesh_totals: dict[str, float] = defaultdict(float)
         index_to_name = {group.index: group.name for group in obj.vertex_groups}
         for vertex in obj.data.vertices:
             for group in vertex.groups:
@@ -221,7 +223,14 @@ def vertex_group_weight_totals() -> dict[str, float]:
                 name = index_to_name.get(group.group)
                 if name:
                     totals[name] += float(group.weight)
-    return dict(totals)
+                    mesh_totals[name] += float(group.weight)
+        by_mesh[obj.name] = dict(mesh_totals)
+    return dict(totals), by_mesh
+
+
+def vertex_group_weight_totals() -> dict[str, float]:
+    totals, _by_mesh = vertex_group_weight_totals_by_mesh()
+    return totals
 
 
 def collect_bones(armature: bpy.types.Object, weight_totals: dict[str, float]) -> list[dict[str, object]]:
@@ -248,7 +257,7 @@ def collect_bones(armature: bpy.types.Object, weight_totals: dict[str, float]) -
     return bones
 
 
-def collect_model_preview(armature: bpy.types.Object, max_vertices: int = 7000, max_edges: int = 8000) -> dict[str, object]:
+def collect_model_preview(armature: bpy.types.Object, max_vertices: int = 500000, max_edges: int = 500000) -> dict[str, object]:
     vertices: list[list[float]] = []
     edges: list[tuple[int, int]] = []
     to_armature = armature.matrix_world.inverted()
@@ -785,6 +794,221 @@ def merge_bone(armature: bpy.types.Object, source: str, target: str, protected: 
     }
 
 
+def final_merge_target(name: str, merged_edges: dict[str, str]) -> tuple[str, list[str]]:
+    current = name
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    while current in merged_edges:
+        if current in seen_set:
+            return current, seen + [current]
+        seen.append(current)
+        seen_set.add(current)
+        current = merged_edges[current]
+    return current, []
+
+
+def prepare_batched_operations(
+    armature: bpy.types.Object,
+    operations: list[dict[str, object]],
+    protected: set[str],
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    existing = {bone.name for bone in armature.data.bones}
+    simulated_parents = parent_map(armature)
+    merged_edges: dict[str, str] = {}
+    applied: list[dict[str, object]] = []
+    children = children_map_from_parents(simulated_parents, existing)
+
+    for index, raw in enumerate(operations, start=1):
+        source = str(raw.get("source") or "")
+        target = str(raw.get("target") or "")
+        base: dict[str, object] = {
+            "source": source,
+            "target": target,
+            "round": raw.get("round"),
+            "order": raw.get("order"),
+            "branch": raw.get("branch"),
+            "plan_reason": raw.get("reason"),
+            "apply_strategy": "batched_internal",
+            "method": "internal",
+        }
+        if not source or not target:
+            base.update({"status": "error", "reason": "missing source or target"})
+        elif source == target:
+            base.update({"status": "skipped", "reason": "source equals target"})
+        elif source not in existing:
+            base.update({"status": "skipped", "reason": "source missing"})
+        elif target not in existing:
+            base.update({"status": "error", "reason": "target missing"})
+        elif source in protected:
+            base.update({"status": "error", "reason": "source is protected"})
+        else:
+            merged_edges[source] = target
+            base.update({"status": "merged", "reason": raw.get("reason")})
+            for child in list(children.get(source, [])):
+                if child in existing and child != target:
+                    simulated_parents[child] = target
+            simulated_parents.pop(source, None)
+            existing.remove(source)
+            children = children_map_from_parents(simulated_parents, existing)
+        print(f"Merge {index}/{len(operations)} prepared: {source} -> {target} [{base.get('status')}]")
+        applied.append(base)
+
+    for result in applied:
+        if result.get("status") != "merged":
+            continue
+        source = str(result.get("source") or "")
+        resolved, cycle = final_merge_target(source, merged_edges)
+        result["resolved_target"] = resolved
+        if cycle:
+            result.update({"status": "error", "reason": "bone merge plan contains a cycle: " + " -> ".join(cycle)})
+    return applied, merged_edges
+
+
+def add_weight_report_fields(
+    applied: list[dict[str, object]],
+    before_weights: dict[str, float],
+    before_weights_by_mesh: dict[str, dict[str, float]],
+) -> None:
+    simulated_weights: dict[str, float] = defaultdict(float, before_weights)
+    simulated_mesh_weights: dict[str, dict[str, float]] = {
+        mesh_name: defaultdict(float, weights) for mesh_name, weights in before_weights_by_mesh.items()
+    }
+
+    for result in applied:
+        source = str(result.get("source") or "")
+        target = str(result.get("target") or "")
+        source_before = float(simulated_weights.get(source, 0.0))
+        target_before = float(simulated_weights.get(target, 0.0))
+        result["source_weight_before"] = round(source_before, 6)
+        result["target_weight_before"] = round(target_before, 6)
+        if result.get("status") == "merged":
+            transferred_by_mesh: dict[str, float] = {}
+            for mesh_name, mesh_weights in simulated_mesh_weights.items():
+                source_mesh_weight = float(mesh_weights.get(source, 0.0))
+                if source_mesh_weight > 0.000001:
+                    transferred_by_mesh[mesh_name] = round(source_mesh_weight, 6)
+                mesh_weights[target] = float(mesh_weights.get(target, 0.0)) + source_mesh_weight
+                mesh_weights.pop(source, None)
+            simulated_weights[target] = target_before + source_before
+            simulated_weights.pop(source, None)
+            result["target_weight_after"] = round(float(simulated_weights.get(target, 0.0)), 6)
+            result["internal_transferred_by_mesh"] = transferred_by_mesh
+        else:
+            result["target_weight_after"] = round(float(simulated_weights.get(target, 0.0)), 6)
+            result["internal_transferred_by_mesh"] = {}
+
+
+def batch_transfer_vertex_groups(
+    armature: bpy.types.Object,
+    merged_edges: dict[str, str],
+) -> dict[str, object]:
+    ensure_object_mode()
+    meshes = associated_meshes(armature)
+    source_to_final: dict[str, str] = {}
+    cycles: list[list[str]] = []
+    for source in merged_edges:
+        resolved, cycle = final_merge_target(source, merged_edges)
+        if cycle:
+            cycles.append(cycle)
+            continue
+        source_to_final[source] = resolved
+
+    final_targets = sorted(set(source_to_final.values()), key=natural_key)
+    source_names = set(source_to_final)
+    per_mesh: dict[str, dict[str, object]] = {}
+    moved_vertex_total = 0
+    moved_weight_total = 0.0
+
+    for obj in meshes:
+        for target in final_targets:
+            if target not in obj.vertex_groups:
+                obj.vertex_groups.new(name=target)
+        index_to_name = {group.index: group.name for group in obj.vertex_groups}
+        additions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        source_weight_totals: dict[str, float] = defaultdict(float)
+        for vertex in obj.data.vertices:
+            for group in vertex.groups:
+                name = index_to_name.get(group.group)
+                if name not in source_to_final or group.weight <= 0.000001:
+                    continue
+                final_target = source_to_final[name]
+                weight = float(group.weight)
+                additions[final_target][vertex.index] += weight
+                source_weight_totals[name] += weight
+
+        mesh_moved_vertices = 0
+        mesh_moved_weight = 0.0
+        for target, vertex_weights in additions.items():
+            target_group = obj.vertex_groups[target]
+            mesh_moved_vertices += len(vertex_weights)
+            for vertex_index, weight in vertex_weights.items():
+                target_group.add([vertex_index], float(weight), "ADD")
+                mesh_moved_weight += float(weight)
+
+        removed_groups: list[str] = []
+        for source in sorted(source_names, key=natural_key):
+            if source in obj.vertex_groups:
+                obj.vertex_groups.remove(obj.vertex_groups[source])
+                removed_groups.append(source)
+
+        moved_vertex_total += mesh_moved_vertices
+        moved_weight_total += mesh_moved_weight
+        per_mesh[obj.name] = {
+            "vertex_count": len(obj.data.vertices),
+            "moved_vertex_count": mesh_moved_vertices,
+            "moved_weight_total": round(mesh_moved_weight, 6),
+            "removed_source_group_count": len(removed_groups),
+            "removed_source_groups": removed_groups,
+            "source_weight_totals": {name: round(value, 6) for name, value in sorted(source_weight_totals.items())},
+        }
+
+    return {
+        "mesh_count": len(meshes),
+        "vertex_count": sum(len(obj.data.vertices) for obj in meshes),
+        "final_target_count": len(final_targets),
+        "source_group_count": len(source_names),
+        "moved_vertex_count": moved_vertex_total,
+        "moved_weight_total": round(moved_weight_total, 6),
+        "cycles": [" -> ".join(cycle) for cycle in cycles],
+        "per_mesh": per_mesh,
+    }
+
+
+def delete_bones_internal_batched(armature: bpy.types.Object, applied: list[dict[str, object]]) -> dict[str, object]:
+    ensure_object_mode()
+    bpy.ops.object.select_all(action="DESELECT")
+    armature.select_set(True)
+    bpy.context.view_layer.objects.active = armature
+    old_mirror = bool(getattr(armature.data, "use_mirror_x", False))
+    armature.data.use_mirror_x = False
+    removed: list[str] = []
+    missing: list[str] = []
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        edit_bones = armature.data.edit_bones
+        for result in applied:
+            if result.get("status") != "merged":
+                continue
+            source = str(result.get("source") or "")
+            target = str(result.get("target") or "")
+            source_bone = edit_bones.get(source)
+            target_bone = edit_bones.get(target)
+            if source_bone is None or target_bone is None:
+                missing.append(f"{source} -> {target}")
+                continue
+            for child in list(source_bone.children):
+                if child.name == target:
+                    continue
+                child.parent = target_bone
+                child.use_connect = False
+            edit_bones.remove(source_bone)
+            removed.append(source)
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature.data.use_mirror_x = old_mirror
+    return {"removed_bone_count": len(removed), "removed_bones": removed, "missing_during_delete": missing}
+
+
 def validate_after_apply(
     armature: bpy.types.Object,
     plan: dict[str, object],
@@ -865,29 +1089,76 @@ def validate_after_apply(
 
 
 def apply_plan(armature: bpy.types.Object, plan: dict[str, object], limit: int) -> dict[str, object]:
+    timings: dict[str, float] = {}
     protected = protected_from_plan(plan, armature)
     operations = enabled_operations(plan)
     before_count = len(armature.data.bones)
-    before_weights = vertex_group_weight_totals()
-    applied: list[dict[str, object]] = []
+    scan_started = time.monotonic()
+    before_weights, before_weights_by_mesh = vertex_group_weight_totals_by_mesh()
+    timings["before_weight_scan_seconds"] = round(time.monotonic() - scan_started, 3)
     print(f"Applying {len(operations)} enabled bone merge operation(s).")
-    for index, raw in enumerate(operations, start=1):
-        source = str(raw.get("source") or "")
-        target = str(raw.get("target") or "")
-        if not source or not target:
-            applied.append({"source": source, "target": target, "status": "error", "reason": "missing source or target"})
-            continue
-        print(f"Merge {index}/{len(operations)}: {source} -> {target}")
-        result = merge_bone(armature, source, target, protected)
-        result.update({"round": raw.get("round"), "order": raw.get("order"), "reason": raw.get("reason")})
-        applied.append(result)
+
+    prepare_started = time.monotonic()
+    applied, merged_edges = prepare_batched_operations(armature, operations, protected)
+    timings["operation_prepare_seconds"] = round(time.monotonic() - prepare_started, 3)
+
+    report_started = time.monotonic()
+    add_weight_report_fields(applied, before_weights, before_weights_by_mesh)
+    timings["weight_report_simulation_seconds"] = round(time.monotonic() - report_started, 3)
+
+    transfer_summary: dict[str, object] = {}
+    delete_summary: dict[str, object] = {}
+    has_preflight_errors = any(result.get("status") == "error" for result in applied)
+    if has_preflight_errors:
+        print("Bone merge preflight found errors; skipping batched mesh and armature edits.")
+    else:
+        transfer_started = time.monotonic()
+        transfer_summary = batch_transfer_vertex_groups(armature, merged_edges)
+        timings["batched_weight_transfer_seconds"] = round(time.monotonic() - transfer_started, 3)
+        if transfer_summary.get("cycles"):
+            for cycle in transfer_summary.get("cycles", []):
+                applied.append(
+                    {
+                        "source": "",
+                        "target": "",
+                        "status": "error",
+                        "reason": f"bone merge plan contains a cycle: {cycle}",
+                        "apply_strategy": "batched_internal",
+                        "method": "internal",
+                    }
+                )
+
+        delete_started = time.monotonic()
+        delete_summary = delete_bones_internal_batched(armature, applied)
+        timings["batched_edit_bone_delete_seconds"] = round(time.monotonic() - delete_started, 3)
+        if delete_summary.get("missing_during_delete"):
+            missing_entries = set(str(entry) for entry in delete_summary.get("missing_during_delete", []))
+            for result in applied:
+                entry = f"{result.get('source')} -> {result.get('target')}"
+                if entry in missing_entries and result.get("status") == "merged":
+                    result.update({"status": "error", "reason": "source or target missing during batched edit-bone delete"})
+
+        after_bones = {bone.name for bone in armature.data.bones}
+        for result in applied:
+            source = str(result.get("source") or "")
+            if result.get("status") == "merged" and source in after_bones:
+                result.update({"status": "error", "reason": "source bone still exists after batched merge"})
+
+    validation_started = time.monotonic()
     validation = validate_after_apply(armature, plan, applied, limit, protected, before_weights)
+    timings["validation_seconds"] = round(time.monotonic() - validation_started, 3)
     return {
         "before_bone_count": before_count,
         "after_bone_count": len(armature.data.bones),
         "limit": limit,
         "operation_count": len(operations),
         "merged_count": sum(1 for result in applied if result.get("status") == "merged"),
+        "apply_strategy": "batched_internal",
+        "mesh_count": int(transfer_summary.get("mesh_count", 0) or 0),
+        "vertex_count": int(transfer_summary.get("vertex_count", 0) or 0),
+        "transfer_summary": transfer_summary,
+        "delete_summary": delete_summary,
+        "timings": timings,
         "applied_operations": applied,
         "validation": validation,
     }
@@ -901,12 +1172,18 @@ def main() -> int:
     started = time.monotonic()
     print("Starting MMD Character Importer Blender step 4.")
     print(f"Opening spine-fixed blend: {args.input_blend}")
+    open_started = time.monotonic()
     bpy.ops.wm.open_mainfile(filepath=str(args.input_blend))
+    open_seconds = round(time.monotonic() - open_started, 3)
+    print(f"Opened spine-fixed blend in {open_seconds:.1f}s")
 
     if args.mode == "analyze":
         if not args.analysis_json:
             raise RuntimeError("--analysis-json is required for analyze mode")
+        analysis_started = time.monotonic()
         analysis, plan = analyze_current_file(args.input_blend, limit)
+        analysis.setdefault("timings", {})["open_blend_seconds"] = open_seconds
+        analysis["timings"]["analysis_seconds"] = round(time.monotonic() - analysis_started, 3)
         write_json(args.analysis_json, analysis)
         write_json(args.plan_json, plan)
         print(f"Wrote bone merge analysis: {args.analysis_json}")
@@ -919,9 +1196,13 @@ def main() -> int:
     if not args.report_json:
         raise RuntimeError("--report-json is required for apply mode")
     plan = load_plan(args.plan_json)
+    before_analysis_started = time.monotonic()
     before_analysis, _before_plan = analyze_current_file(args.input_blend, limit)
+    before_analysis_seconds = round(time.monotonic() - before_analysis_started, 3)
     armature = active_armature()
+    apply_started = time.monotonic()
     result = apply_plan(armature, plan, limit)
+    apply_seconds = round(time.monotonic() - apply_started, 3)
     if not result["validation"]["ok"]:
         print("Validation failed after bone sorting.")
         for error in result["validation"]["errors"]:
@@ -929,14 +1210,26 @@ def main() -> int:
         raise RuntimeError("Bone sorting validation failed after apply.")
     args.output_blend.parent.mkdir(parents=True, exist_ok=True)
     print(f"Saving bone-sorted blend file: {args.output_blend}")
+    save_started = time.monotonic()
     bpy.ops.wm.save_as_mainfile(filepath=str(args.output_blend))
+    save_seconds = round(time.monotonic() - save_started, 3)
+    after_analysis_started = time.monotonic()
     after_analysis, _after_plan = analyze_current_file(args.output_blend, limit)
+    after_analysis_seconds = round(time.monotonic() - after_analysis_started, 3)
     report = {
         "version": 1,
         "input_blend": str(args.input_blend),
         "output_blend": str(args.output_blend),
         "plan_json": str(args.plan_json),
         "elapsed_seconds": round(time.monotonic() - started, 3),
+        "timings": {
+            "open_blend_seconds": open_seconds,
+            "before_analysis_seconds": before_analysis_seconds,
+            "apply_seconds": apply_seconds,
+            "apply": result.get("timings", {}),
+            "save_seconds": save_seconds,
+            "after_analysis_seconds": after_analysis_seconds,
+        },
         "before": before_analysis,
         "after": after_analysis,
         "applied": result,

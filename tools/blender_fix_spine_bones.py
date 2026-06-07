@@ -156,7 +156,7 @@ def collect_bones(armature: bpy.types.Object, weighted: set[str]) -> list[dict[s
     return bones
 
 
-def collect_model_preview(armature: bpy.types.Object, max_vertices: int = 7000, max_edges: int = 8000) -> dict[str, object]:
+def collect_model_preview(armature: bpy.types.Object, max_vertices: int = 500000, max_edges: int = 500000) -> dict[str, object]:
     vertices: list[list[float]] = []
     edges: list[tuple[int, int]] = []
     to_armature = armature.matrix_world.inverted()

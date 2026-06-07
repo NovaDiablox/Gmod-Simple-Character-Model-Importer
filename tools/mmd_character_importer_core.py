@@ -69,6 +69,7 @@ CancelCheck = Callable[[], bool]
 DEFAULT_BODYGROUP_SCALE_FACTOR = 40.457
 DEFAULT_BODYGROUP_VERTEX_LIMIT = 65535
 RTX_BODYGROUP_VERTEX_LIMIT = 32767
+MAX_SUPPORTED_PMX_VERTEX_COUNT = 240_000
 CONTENT_WARNING_KEYWORD_THRESHOLD = 5
 BODYGROUP_SCALE_PRESETS: dict[str, Path] = {
     "tall": Path("E:/G/Upload/acheron/5_propo/Face.smd"),
@@ -715,6 +716,68 @@ def software_blender_root() -> Path:
     return app_local_dir() / "software" / "blender"
 
 
+def delete_managed_blender_cache() -> dict[str, object]:
+    """Delete only the importer-managed local Blender install and setup state."""
+
+    root = software_blender_root()
+    app_root = app_local_dir().resolve()
+    try:
+        resolved_root = root.resolve()
+    except Exception:
+        resolved_root = root.absolute()
+    if resolved_root != app_root and app_root not in resolved_root.parents:
+        raise RuntimeError(f"Refusing to delete path outside importer local data: {root}")
+
+    size_bytes = 0
+    file_count = 0
+    if root.exists() and root.is_dir() and not root.is_symlink():
+        stack = [root]
+        while stack:
+            folder = stack.pop()
+            try:
+                with os.scandir(folder) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            else:
+                                size_bytes += entry.stat(follow_symlinks=False).st_size
+                                file_count += 1
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+
+    removed_blender = False
+    if root.exists():
+        if root.is_dir() and not root.is_symlink():
+            def on_rmtree_error(func, path, _exc_info) -> None:
+                import stat
+
+                os.chmod(path, stat.S_IWUSR)
+                func(path)
+
+            shutil.rmtree(root, onerror=on_rmtree_error)
+        else:
+            root.unlink()
+        removed_blender = True
+
+    state_path = setup_state_path()
+    removed_state = False
+    if state_path.exists():
+        state_path.unlink()
+        removed_state = True
+
+    return {
+        "blender_root": str(root),
+        "setup_state": str(state_path),
+        "removed_blender": removed_blender,
+        "removed_state": removed_state,
+        "size_bytes": size_bytes,
+        "file_count": file_count,
+    }
+
+
 def workspaces_root() -> Path:
     return app_local_dir() / "workspaces"
 
@@ -1101,6 +1164,13 @@ def native_process_failure_diagnostic(return_code: int, command: list[str]) -> s
     )
 
 
+def is_suppressed_process_output_line(line: str) -> bool:
+    return (
+        line.startswith("WARN (bmesh.mesh.convert):")
+        and "bm_to_mesh_shape: Found shape-key but no CD_SHAPEKEY layers" in line
+    )
+
+
 def run_process_streamed(
     command: list[str],
     progress: ProgressCallback | None = None,
@@ -1113,6 +1183,7 @@ def run_process_streamed(
     output_lines: list[str] = []
     with contextlib.ExitStack() as stack:
         log_handle = stack.enter_context(log_path.open("w", encoding="utf-8", errors="replace")) if log_path else None
+        suppressed_bmesh_shape_warnings = 0
         process = subprocess.Popen(
             command,
             text=True,
@@ -1139,6 +1210,9 @@ def run_process_streamed(
             line = process.stdout.readline()
             if line:
                 clean = line.rstrip("\r\n")
+                if is_suppressed_process_output_line(clean):
+                    suppressed_bmesh_shape_warnings += 1
+                    continue
                 output_lines.append(clean)
                 if log_handle:
                     log_handle.write(clean + "\n")
@@ -1152,6 +1226,16 @@ def run_process_streamed(
             time.sleep(0.05)
 
         return_code = process.wait()
+        if suppressed_bmesh_shape_warnings:
+            summary = (
+                "Suppressed "
+                f"{suppressed_bmesh_shape_warnings:,} repeated Blender bmesh shape-key conversion warning(s)."
+            )
+            output_lines.append(summary)
+            if log_handle:
+                log_handle.write(summary + "\n")
+                log_handle.flush()
+            emit(progress, summary)
     output = "\n".join(output_lines)
     if cancelled:
         raise RuntimeError("operation was cancelled")
@@ -1687,6 +1771,11 @@ def analyze_pmx(pmx_path: Path, source_dir: Path | None = None) -> PmxAnalysis:
         reader.read_string(analysis.encoding)
 
         analysis.vertex_count = reader.read_i32()
+        if analysis.vertex_count > MAX_SUPPORTED_PMX_VERTEX_COUNT:
+            raise RuntimeError(
+                f"PMX vertex count {analysis.vertex_count:,} exceeds the supported limit of "
+                f"{MAX_SUPPORTED_PMX_VERTEX_COUNT:,}. This model is too large for the importer."
+            )
         for _ in range(analysis.vertex_count):
             skip_vertex(reader, bone_index_size, additional_uvs)
 

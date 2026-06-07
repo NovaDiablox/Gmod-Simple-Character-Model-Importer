@@ -196,6 +196,159 @@ def split_gmod_path_input(raw: object) -> tuple[str, str]:
     return text, ""
 
 
+def gmod_game_dir_from_path_input(raw: object) -> tuple[Path | None, str]:
+    resolved = resolve_gmod_path_input(raw)
+    if not resolved.get("ok"):
+        return None, str(resolved.get("error") or "Garry's Mod path is not valid.")
+    kind = str(resolved.get("kind") or "")
+    if kind == "studiomdl":
+        studiomdl = safe_resolve_path(Path(str(resolved.get("studiomdl") or "")))
+        game_dir = studiomdl.parent.parent / "garrysmod"
+    elif kind == "install_root":
+        game_dir = safe_resolve_path(Path(str(resolved.get("gmod_root") or ""))) / "garrysmod"
+    elif kind == "game_dir":
+        game_dir = safe_resolve_path(Path(str(resolved.get("gmod_root") or "")))
+    else:
+        return None, "Garry's Mod path type is not recognized."
+    if not game_dir.exists():
+        return None, f"Garry's Mod game folder was not found: {game_dir}"
+    if not (game_dir / "gameinfo.txt").exists():
+        return None, f"Selected path does not look like a Garry's Mod game folder: {game_dir}"
+    addons_dir = game_dir / "addons"
+    if not addons_dir.exists():
+        return None, f"Garry's Mod addons folder was not found: {addons_dir}"
+    return game_dir, ""
+
+
+def is_dynamic_model_importer_manifest(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind == "dynamic_model_importer_manifest":
+        return True
+    generated_by = str(payload.get("generated_by") or "").strip().lower()
+    if "mmd character importer" in generated_by:
+        return True
+    paths = payload.get("paths")
+    return isinstance(paths, dict) and bool(payload.get("manifest_id")) and bool(paths.get("model"))
+
+
+def load_dynamic_model_importer_manifest(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not is_dynamic_model_importer_manifest(payload):
+        return None
+    return payload
+
+
+def addon_dir_has_importer_manifest(addon_dir: Path) -> bool:
+    manifest_dir = addon_dir / "data_static" / "dynamic_model_importer" / "models"
+    if not manifest_dir.exists():
+        return False
+    for manifest_path in manifest_dir.glob("*.json"):
+        if load_dynamic_model_importer_manifest(manifest_path) is not None:
+            return True
+    return False
+
+
+def folder_size_and_mtime(root: Path) -> tuple[int, float]:
+    total_size = 0
+    newest_mtime = 0.0
+    stack = [Path(root)]
+    while stack:
+        folder = stack.pop()
+        try:
+            stat = folder.stat()
+            newest_mtime = max(newest_mtime, float(stat.st_mtime))
+        except OSError:
+            pass
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        else:
+                            stat = entry.stat(follow_symlinks=False)
+                            total_size += int(stat.st_size)
+                            newest_mtime = max(newest_mtime, float(stat.st_mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total_size, newest_mtime
+
+
+def scan_importer_model_addons(gmod_path: object) -> dict[str, object]:
+    game_dir, error = gmod_game_dir_from_path_input(gmod_path)
+    if game_dir is None:
+        raise RuntimeError(error)
+    addons_dir = game_dir / "addons"
+    models: list[dict[str, object]] = []
+    with os.scandir(addons_dir) as entries:
+        addon_dirs = sorted(
+            (Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False)),
+            key=lambda item: item.name.lower(),
+        )
+    for addon_dir in addon_dirs:
+        manifest_dir = addon_dir / "data_static" / "dynamic_model_importer" / "models"
+        if not manifest_dir.exists():
+            continue
+        manifests: list[dict[str, object]] = []
+        manifest_paths: list[str] = []
+        for manifest_path in sorted(manifest_dir.glob("*.json"), key=lambda item: item.name.lower()):
+            payload = load_dynamic_model_importer_manifest(manifest_path)
+            if payload is None:
+                continue
+            manifests.append(payload)
+            manifest_paths.append(str(manifest_path))
+        if not manifests:
+            continue
+        display_names: list[str] = []
+        manifest_ids: list[str] = []
+        authors: list[str] = []
+        categories: list[str] = []
+        model_paths: list[str] = []
+        for manifest in manifests:
+            display = str(manifest.get("display_name") or manifest.get("model_name") or manifest.get("manifest_id") or "").strip()
+            if display and display not in display_names:
+                display_names.append(display)
+            manifest_id = str(manifest.get("manifest_id") or manifest.get("addon_id") or "").strip()
+            if manifest_id and manifest_id not in manifest_ids:
+                manifest_ids.append(manifest_id)
+            author = str(manifest.get("author") or "").strip()
+            if author and author not in authors:
+                authors.append(author)
+            category = str(manifest.get("category_readable") or manifest.get("character_category") or "").strip()
+            if category and category not in categories:
+                categories.append(category)
+            paths = manifest.get("paths")
+            if isinstance(paths, dict):
+                for key in ("model", "player_model", "arms_model"):
+                    model_path = str(paths.get(key) or "").strip()
+                    if model_path and model_path not in model_paths:
+                        model_paths.append(model_path)
+        size_bytes, modified_time = folder_size_and_mtime(addon_dir)
+        models.append(
+            {
+                "addon_dir": str(addon_dir),
+                "addon_name": addon_dir.name,
+                "display_names": display_names,
+                "manifest_ids": manifest_ids,
+                "authors": authors,
+                "categories": categories,
+                "model_paths": model_paths,
+                "manifest_count": len(manifests),
+                "manifest_paths": manifest_paths,
+                "size_bytes": size_bytes,
+                "modified_time": modified_time,
+            }
+        )
+    return {"game_dir": str(game_dir), "addons_dir": str(addons_dir), "models": models}
+
+
 def sanitize_internal_identifier_text(value: object) -> str:
     return INTERNAL_IDENTIFIER_UNSAFE_RE.sub("", str(value or ""))
 
@@ -2085,6 +2238,17 @@ class FullImportWorker(QtCore.QThread):
             validation=validation or {"ok": True},
         )
 
+    def _is_benign_auto_warning(self, step: int, text: str) -> bool:
+        if step == 6 and text.startswith("CATS material separation failed; using Blender fallback:"):
+            return True
+        if step == 8 and text.startswith("Included ") and text.endswith(" child-bone joint faces so this bone exports as one filled collision region."):
+            return True
+        if step == 8 and text.startswith("Included ") and text.endswith(" child-bone joint samples to fill the connected collision span."):
+            return True
+        if step == 11 and text == "L4D2 auto_pose unavailable; manual VRD action fallback was used.":
+            return True
+        return False
+
     def _require_clean_report(self, step: int, report: dict[str, object], context: str) -> None:
         validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
         validation_errors = report.get("validation_errors") if isinstance(report.get("validation_errors"), list) else []
@@ -2109,6 +2273,8 @@ class FullImportWorker(QtCore.QThread):
         for warning in report_warnings:
             text = str(warning).strip()
             if not text:
+                continue
+            if self._is_benign_auto_warning(step, text):
                 continue
             labelled = f"Step {step} ({context}): {text}"
             if labelled not in self.optional_warnings:
@@ -2448,6 +2614,76 @@ class WorkspaceCleanupWorker(QtCore.QThread):
             pass
 
 
+class ManagedBlenderDeleteWorker(QtCore.QThread):
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.done.emit(core.delete_managed_blender_cache())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ModelManagerScanWorker(QtCore.QThread):
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, gmod_path: str) -> None:
+        super().__init__()
+        self.gmod_path = gmod_path
+
+    def run(self) -> None:
+        try:
+            self.done.emit(scan_importer_model_addons(self.gmod_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ModelManagerRemoveWorker(QtCore.QThread):
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, addons_dir: str, addon_dirs: list[str]) -> None:
+        super().__init__()
+        self.addons_dir = addons_dir
+        self.addon_dirs = addon_dirs
+
+    def run(self) -> None:
+        try:
+            addons_root = safe_resolve_path(Path(self.addons_dir))
+            removed: list[str] = []
+            failures: list[str] = []
+            for raw_addon_dir in self.addon_dirs:
+                addon_dir = Path(raw_addon_dir)
+                try:
+                    resolved = safe_resolve_path(addon_dir)
+                    if resolved.parent != addons_root:
+                        failures.append(f"Skipped path outside selected addons folder: {addon_dir}")
+                        continue
+                    if resolved.is_symlink() or not resolved.is_dir():
+                        failures.append(f"Skipped non-folder addon path: {addon_dir}")
+                        continue
+                    if not addon_dir_has_importer_manifest(resolved):
+                        failures.append(f"Skipped folder without Dynamic Model Importer manifest: {addon_dir}")
+                        continue
+                    shutil.rmtree(resolved, onerror=self._on_rmtree_error)
+                    removed.append(str(resolved))
+                except Exception as exc:
+                    failures.append(f"{addon_dir}: {exc}")
+            self.done.emit({"removed": removed, "failures": failures})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _on_rmtree_error(self, func, path, exc_info) -> None:
+        import stat
+        try:
+            os.chmod(path, stat.S_IWUSR)
+            func(path)
+        except Exception:
+            pass
+
+
 class ReleaseAnalyzeWorker(QtCore.QThread):
     log = QtCore.Signal(str)
     done = QtCore.Signal(dict)
@@ -2673,8 +2909,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_output_files: dict[str, object] | None = None
         self.workspace_size_worker: WorkspaceSizeWorker | None = None
         self.workspace_cleanup_worker: WorkspaceCleanupWorker | None = None
+        self.managed_blender_delete_worker: ManagedBlenderDeleteWorker | None = None
         self.workspace_cache_size_bytes = 0
         self.workspace_cache_folder_count = 0
+        self.model_manager_scan_worker: ModelManagerScanWorker | None = None
+        self.model_manager_remove_worker: ModelManagerRemoveWorker | None = None
+        self.model_manager_models: list[dict[str, object]] = []
+        self.model_manager_addons_dir = ""
         self.category_suggestion_sources: list[str] = []
         self.category_scan_roots: list[Path] = []
         self.known_category_pairs: list[dict[str, object]] = self.scan_known_category_suggestions()
@@ -2726,6 +2967,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._updating_vrd_intensity_controls = False
         self._updating_texture_table = False
         self._updating_qc_table = False
+        self._updating_qc_jiggle_controls = False
+        self._updating_qc_physics_table = False
         self.pmx_paths: list[Path] = []
 
         self.setWindowTitle(self._t("app.title", "MMD Character Importer"))
@@ -2737,6 +2980,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.tabs.currentChanged.connect(lambda _index: self.refresh_workflow_statuses() if self.workflow_specs else None)
         self.setCentralWidget(self.tabs)
         self._build_main_tab()
+        self._build_model_manager_tab()
         self._build_import_tab()
         self._build_fix_tab()
         self._build_spine_tab()
@@ -3256,9 +3500,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def apply_main_i18n(self) -> None:
         self.setWindowTitle(self._t("app.title", "MMD Character Importer"))
         if hasattr(self, "main_tab"):
-            index = self.tabs.indexOf(self.main_tab)
+            index = self.tab_index_for_content_widget(self.main_tab)
             if index >= 0:
                 self.tabs.setTabText(index, self._t("tabs.main", "Main Import to GMod"))
+        if hasattr(self, "model_manager_tab"):
+            index = self.tab_index_for_content_widget(self.model_manager_tab)
+            if index >= 0:
+                self.tabs.setTabText(index, self._t("tabs.model_manager", "Model Manager"))
         combo = getattr(self, "main_language_combo", None)
         if isinstance(combo, QtWidgets.QComboBox):
             language_index = combo.findData(self.language_code)
@@ -3345,6 +3593,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "main_reset_preview_button": self._t("preview.reset_view", "Reset View"),
             "main_copy_log_button": self._t("common.copy_log", "Copy Log"),
             "main_clear_workspace_cache_button": self._t("main.clear_workspace_cache", "Clear All Cache and Intermediate Files"),
+            "main_delete_blender_cache_button": self._t("main.delete_blender_cache", "Delete Local Blender"),
             "main_contact_author_button": self._t("main.contact_author", "Contact author"),
             "main_youtube_tutorial_button": self._t("main.watch_tutorial_youtube", "Watch Tutorial on Youtube"),
             "main_bilibili_tutorial_button": self._t("main.watch_tutorial_bilibili", "Watch Tutorial on Bilibili"),
@@ -3382,6 +3631,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self._t(
                     "main.clear_workspace_cache_tip",
                     "Delete all generated folders and loose files inside the MMD Character Importer workspaces folder.",
+                )
+            )
+        if hasattr(self, "main_delete_blender_cache_button"):
+            self.main_delete_blender_cache_button.setToolTip(
+                self._t(
+                    "main.delete_blender_cache_tip",
+                    "Delete the importer-managed local Blender install. The next port will reinstall bundled Blender.",
                 )
             )
         self.update_workspace_cache_size_label()
@@ -3489,6 +3745,18 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 return index
         return int(step)
 
+    def tab_index_for_content_widget(self, widget: QtWidgets.QWidget | None) -> int:
+        if widget is None:
+            return -1
+        direct = self.tabs.indexOf(widget)
+        if direct >= 0:
+            return direct
+        for index in range(self.tabs.count()):
+            tab_widget = self.tabs.widget(index)
+            if isinstance(tab_widget, QtWidgets.QScrollArea) and tab_widget.widget() is widget:
+                return index
+        return -1
+
     def switch_to_step(self, step: int) -> None:
         index = self.step_to_tab_index(step)
         if 0 <= index < self.tabs.count():
@@ -3499,14 +3767,18 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def set_advanced_steps_visible(self, visible: bool) -> None:
         visible = bool(visible)
         self.advanced_steps_visible = visible
+        main_index = self.tab_index_for_content_widget(getattr(self, "main_tab", None))
+        manager_index = self.tab_index_for_content_widget(getattr(self, "model_manager_tab", None))
         for index in range(self.tabs.count()):
-            is_main = index == 0
+            is_primary = index == main_index or index == manager_index
             try:
-                self.tabs.setTabVisible(index, is_main or visible)
+                self.tabs.setTabVisible(index, is_primary or visible)
             except AttributeError:
-                self.tabs.tabBar().setTabVisible(index, is_main or visible)
-        if not visible and self.tabs.currentIndex() != 0:
-            self.tabs.setCurrentIndex(0)
+                self.tabs.tabBar().setTabVisible(index, is_primary or visible)
+        if not visible:
+            current = self.tabs.currentIndex()
+            if current not in {main_index, manager_index}:
+                self.tabs.setCurrentIndex(max(0, main_index))
         button = getattr(self, "main_advanced_steps_button", None)
         if isinstance(button, QtWidgets.QPushButton):
             blocker = QtCore.QSignalBlocker(button)
@@ -4473,8 +4745,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_workspace_cache_size_label.setObjectName("fieldHint")
         self.main_workspace_cache_size_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.main_workspace_cache_size_label.setToolTip(str(core.workspaces_root()))
+        self.main_delete_blender_cache_button = QtWidgets.QPushButton("Delete Local Blender")
+        self.main_delete_blender_cache_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogResetButton))
+        self.main_delete_blender_cache_button.setToolTip(
+            "Delete the importer-managed local Blender install. The next port will reinstall bundled Blender."
+        )
         cache_cleanup_layout.addWidget(self.main_clear_workspace_cache_button, 0)
         cache_cleanup_layout.addWidget(self.main_workspace_cache_size_label, 0)
+        cache_cleanup_layout.addWidget(self.main_delete_blender_cache_button, 0)
         cache_cleanup_layout.addStretch(1)
         layout.addLayout(cache_cleanup_layout)
 
@@ -4492,6 +4770,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_outputs_toggle.toggled.connect(self.set_main_outputs_visible)
         self.main_log_toggle.toggled.connect(self.set_main_log_visible)
         self.main_clear_workspace_cache_button.clicked.connect(self.clear_workspace_cache)
+        self.main_delete_blender_cache_button.clicked.connect(self.delete_managed_blender_cache)
         self.main_category_edit.textChanged.connect(lambda _value: self.update_main_display_placeholders())
         self.main_model_name_edit.textChanged.connect(lambda _value: self.update_main_display_placeholders())
         self.main_rtx_bodygroup_limit_check.toggled.connect(self.on_bodygroup_rtx_limit_changed)
@@ -4509,6 +4788,76 @@ class ImporterWindow(QtWidgets.QMainWindow):
         scroll.setWidget(content)
         tab_layout.addWidget(scroll)
         self.tabs.addTab(tab, "Main Import to GMod")
+
+    def _build_model_manager_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.model_manager_tab = tab
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.model_manager_intro_label = QtWidgets.QLabel(
+            "Find ported models tagged by this importer in Garry's Mod addons, review their size and last edit date, and remove unwanted generated addon folders."
+        )
+        self.model_manager_intro_label.setObjectName("fieldHint")
+        self.model_manager_intro_label.setWordWrap(True)
+        layout.addWidget(self.model_manager_intro_label)
+
+        self.model_manager_gmod_row = PathRow(
+            "GMod / StudioMDL",
+            "file",
+            "StudioMDL (studiomdl.exe);;All files (*.*)",
+            required=True,
+            hint="Browse to studiomdl.exe, the Garry's Mod install folder, or garrysmod folder",
+        )
+        layout.addWidget(self.model_manager_gmod_row)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.model_manager_detect_button = QtWidgets.QPushButton("Detect GMod")
+        self.model_manager_detect_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon))
+        self.model_manager_browse_folder_button = QtWidgets.QPushButton("Browse GMod Folder")
+        self.model_manager_browse_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.model_manager_scan_button = QtWidgets.QPushButton("Scan Ported Models")
+        self.model_manager_scan_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+        self.model_manager_open_addons_button = QtWidgets.QPushButton("Open Addons Folder")
+        self.model_manager_open_addons_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.model_manager_remove_button = QtWidgets.QPushButton("Remove Selected")
+        self.model_manager_remove_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogDiscardButton))
+        actions.addWidget(self.model_manager_detect_button)
+        actions.addWidget(self.model_manager_browse_folder_button)
+        actions.addWidget(self.model_manager_scan_button)
+        actions.addWidget(self.model_manager_open_addons_button)
+        actions.addWidget(self.model_manager_remove_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.model_manager_summary_label = QtWidgets.QLabel("Select a Garry's Mod path and scan.")
+        self.model_manager_summary_label.setObjectName("fieldHint")
+        self.model_manager_summary_label.setWordWrap(True)
+        self.model_manager_summary_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.model_manager_summary_label)
+
+        self.model_manager_table = QtWidgets.QTableWidget(0, 7)
+        self.model_manager_table.setHorizontalHeaderLabels(
+            ["Name", "Addon Folder", "Size", "Ported Date", "Author", "Category", "Model Paths"]
+        )
+        self.model_manager_table.verticalHeader().setVisible(False)
+        self.model_manager_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.model_manager_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.model_manager_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.model_manager_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.model_manager_table.horizontalHeader().setStretchLastSection(True)
+        self.model_manager_table.setSortingEnabled(True)
+        layout.addWidget(self.model_manager_table, 1)
+
+        self.model_manager_gmod_row.changed.connect(lambda _value: self.save_settings())
+        self.model_manager_detect_button.clicked.connect(self.detect_gmod_for_model_manager)
+        self.model_manager_browse_folder_button.clicked.connect(self.browse_model_manager_gmod_folder)
+        self.model_manager_scan_button.clicked.connect(self.refresh_model_manager_models)
+        self.model_manager_open_addons_button.clicked.connect(self.open_model_manager_addons_folder)
+        self.model_manager_remove_button.clicked.connect(self.remove_selected_model_manager_models)
+        self.model_manager_table.itemSelectionChanged.connect(self.update_model_manager_buttons)
+        self.tabs.addTab(tab, "Model Manager")
 
     def _build_import_tab(self) -> None:
         tab = QtWidgets.QWidget()
@@ -7373,6 +7722,132 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_bone_table.viewport().setMouseTracking(True)
         self.qc_bone_table.viewport().installEventFilter(self)
         bone_layout.addWidget(self.qc_bone_table, 1)
+
+        self.qc_advanced_toggle = QtWidgets.QToolButton()
+        self.qc_advanced_toggle.setText("Show Advanced Jiggle / Physics Controls")
+        self.qc_advanced_toggle.setCheckable(True)
+        self.qc_advanced_toggle.setChecked(False)
+        self.qc_advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.qc_advanced_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowForward))
+        bone_layout.addWidget(self.qc_advanced_toggle, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        self.qc_advanced_panel = QtWidgets.QTabWidget()
+        self.qc_advanced_panel.setVisible(False)
+
+        jiggle_tab = QtWidgets.QWidget()
+        jiggle_layout = QtWidgets.QVBoxLayout(jiggle_tab)
+        jiggle_layout.setContentsMargins(6, 6, 6, 6)
+        filter_group = QtWidgets.QGroupBox("Quick Jigglebone Selection")
+        filter_layout = QtWidgets.QGridLayout(filter_group)
+        self.qc_filter_keyword_edit = QtWidgets.QLineEdit()
+        self.qc_filter_keyword_edit.setPlaceholderText("keyword filter, for example hair skirt sleeve _L_ 左")
+        self.qc_filter_root_edit = QtWidgets.QLineEdit()
+        self.qc_filter_root_edit.setPlaceholderText("root/parent bone filter, for example ValveBiped.Bip01_Head1")
+        self.qc_filter_descendants_check = QtWidgets.QCheckBox("Include descendants")
+        self.qc_filter_descendants_check.setChecked(True)
+        filter_layout.addWidget(QtWidgets.QLabel("Keywords"), 0, 0)
+        filter_layout.addWidget(self.qc_filter_keyword_edit, 0, 1, 1, 5)
+        filter_layout.addWidget(QtWidgets.QLabel("Root / parent"), 1, 0)
+        filter_layout.addWidget(self.qc_filter_root_edit, 1, 1, 1, 4)
+        filter_layout.addWidget(self.qc_filter_descendants_check, 1, 5)
+        preset_row = QtWidgets.QHBoxLayout()
+        self.qc_filter_hair_button = QtWidgets.QPushButton("Hair")
+        self.qc_filter_sleeves_button = QtWidgets.QPushButton("Sleeves")
+        self.qc_filter_skirt_button = QtWidgets.QPushButton("Skirt")
+        self.qc_filter_left_button = QtWidgets.QPushButton("Left side")
+        self.qc_filter_right_button = QtWidgets.QPushButton("Right side")
+        self.qc_filter_clear_button = QtWidgets.QPushButton("Clear filter")
+        for button in (
+            self.qc_filter_hair_button,
+            self.qc_filter_sleeves_button,
+            self.qc_filter_skirt_button,
+            self.qc_filter_left_button,
+            self.qc_filter_right_button,
+            self.qc_filter_clear_button,
+        ):
+            preset_row.addWidget(button)
+        preset_row.addStretch(1)
+        filter_layout.addLayout(preset_row, 2, 0, 1, 6)
+        action_row = QtWidgets.QHBoxLayout()
+        self.qc_select_filtered_button = QtWidgets.QPushButton("Select filtered bones")
+        self.qc_clear_bone_selection_button = QtWidgets.QPushButton("Clear selection")
+        self.qc_set_directional_button = QtWidgets.QPushButton("Set selected Directional")
+        self.qc_set_omni_button = QtWidgets.QPushButton("Set selected Omni")
+        self.qc_set_spring_button = QtWidgets.QPushButton("Set selected Spring")
+        self.qc_set_not_jiggle_button = QtWidgets.QPushButton("Set selected No Jiggle")
+        for button in (
+            self.qc_select_filtered_button,
+            self.qc_clear_bone_selection_button,
+            self.qc_set_directional_button,
+            self.qc_set_omni_button,
+            self.qc_set_spring_button,
+            self.qc_set_not_jiggle_button,
+        ):
+            action_row.addWidget(button)
+        action_row.addStretch(1)
+        filter_layout.addLayout(action_row, 3, 0, 1, 6)
+        self.qc_filter_status_label = QtWidgets.QLabel("Run Analyze QC, then filter or select bones.")
+        self.qc_filter_status_label.setObjectName("fieldHint")
+        self.qc_filter_status_label.setWordWrap(True)
+        filter_layout.addWidget(self.qc_filter_status_label, 4, 0, 1, 6)
+        jiggle_layout.addWidget(filter_group)
+
+        param_group = QtWidgets.QGroupBox("Selected Jigglebone Parameters")
+        param_layout = QtWidgets.QGridLayout(param_group)
+        self.qc_jiggle_param_spins: dict[str, QtWidgets.QDoubleSpinBox] = {}
+        jiggle_param_specs = [
+            ("pitch_min", "Pitch min", -180.0, 180.0, 2),
+            ("pitch_max", "Pitch max", -180.0, 180.0, 2),
+            ("yaw_min", "Yaw min", -180.0, 180.0, 2),
+            ("yaw_max", "Yaw max", -180.0, 180.0, 2),
+            ("length", "Length", 0.0, 1000.0, 2),
+            ("tip_mass", "Tip mass", 0.0, 10000.0, 2),
+            ("pitch_stiffness", "Pitch stiffness", 0.0, 10000.0, 2),
+            ("pitch_damping", "Pitch damping", 0.0, 10000.0, 2),
+            ("yaw_stiffness", "Yaw stiffness", 0.0, 10000.0, 2),
+            ("yaw_damping", "Yaw damping", 0.0, 10000.0, 2),
+            ("along_stiffness", "Along stiffness", 0.0, 10000.0, 2),
+            ("along_damping", "Along damping", 0.0, 10000.0, 2),
+            ("angle_constraint", "Angle constraint", 0.0, 360.0, 2),
+        ]
+        for index, (key, label, minimum, maximum, decimals) in enumerate(jiggle_param_specs):
+            row = index // 4
+            column = (index % 4) * 2
+            spin = self.make_qc_double_spin(minimum, maximum, decimals, 1.0)
+            spin.setProperty("qc_param_key", key)
+            spin.valueChanged.connect(self.on_qc_jiggle_param_changed)
+            self.qc_jiggle_param_spins[key] = spin
+            param_layout.addWidget(QtWidgets.QLabel(label), row, column)
+            param_layout.addWidget(spin, row, column + 1)
+        self.qc_reset_jiggle_params_button = QtWidgets.QPushButton("Reset selected to type defaults")
+        param_layout.addWidget(self.qc_reset_jiggle_params_button, 4, 0, 1, 8)
+        jiggle_layout.addWidget(param_group)
+        jiggle_layout.addStretch(1)
+        self.qc_advanced_panel.addTab(jiggle_tab, "Jigglebone Selection")
+
+        physics_tab = QtWidgets.QWidget()
+        physics_layout = QtWidgets.QVBoxLayout(physics_tab)
+        physics_layout.setContentsMargins(6, 6, 6, 6)
+        self.qc_physics_hint_label = QtWidgets.QLabel(
+            "Edit generated $jointconstrain physics values. Numeric cells are validated with spin boxes; min values must not exceed max values."
+        )
+        self.qc_physics_hint_label.setObjectName("fieldHint")
+        self.qc_physics_hint_label.setWordWrap(True)
+        physics_layout.addWidget(self.qc_physics_hint_label)
+        self.qc_physics_table = QtWidgets.QTableWidget(0, 12)
+        self.qc_physics_table.setHorizontalHeaderLabels(
+            ["Bone", "Mass Bias", "Rot Damp", "X Min", "X Max", "X Fric", "Y Min", "Y Max", "Y Fric", "Z Min", "Z Max", "Z Fric"]
+        )
+        self.qc_physics_table.verticalHeader().setVisible(False)
+        self.qc_physics_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.qc_physics_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.qc_physics_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_physics_table.horizontalHeader().setStretchLastSection(False)
+        physics_layout.addWidget(self.qc_physics_table, 1)
+        self.qc_reset_physics_button = QtWidgets.QPushButton("Reload analyzed physics defaults")
+        physics_layout.addWidget(self.qc_reset_physics_button, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.qc_advanced_panel.addTab(physics_tab, "Physics Constraints")
+        bone_layout.addWidget(self.qc_advanced_panel, 0)
         table_layout.addWidget(bone_group, 2)
 
         files_group = QtWidgets.QGroupBox("Final Addon Files")
@@ -7470,6 +7945,28 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_outputs_toggle.toggled.connect(self.set_qc_outputs_visible)
         self.qc_log_toggle.toggled.connect(self.set_qc_log_visible)
         self.qc_bone_table.itemSelectionChanged.connect(self.on_qc_bone_selection_changed)
+        self.qc_advanced_toggle.toggled.connect(self.set_qc_advanced_visible)
+        self.qc_filter_keyword_edit.textChanged.connect(lambda _value: self.update_qc_filter_status())
+        self.qc_filter_root_edit.textChanged.connect(lambda _value: self.update_qc_filter_status())
+        self.qc_filter_descendants_check.toggled.connect(lambda _value: self.update_qc_filter_status())
+        self.qc_filter_hair_button.clicked.connect(lambda: self.set_qc_bone_filter("", "ValveBiped.Bip01_Head1", True))
+        self.qc_filter_sleeves_button.clicked.connect(
+            lambda: self.set_qc_bone_filter("", "ValveBiped.Bip01_L_Clavicle, ValveBiped.Bip01_R_Clavicle", True)
+        )
+        self.qc_filter_skirt_button.clicked.connect(
+            lambda: self.set_qc_bone_filter("skirt, skirt_, skirt, 裙", "ValveBiped.Bip01_Pelvis, ValveBiped.Bip01_Spine, ValveBiped.Bip01_Spine1", True)
+        )
+        self.qc_filter_left_button.clicked.connect(lambda: self.set_qc_bone_filter("_L_, left, 左", "", True))
+        self.qc_filter_right_button.clicked.connect(lambda: self.set_qc_bone_filter("_R_, right, 右", "", True))
+        self.qc_filter_clear_button.clicked.connect(lambda: self.set_qc_bone_filter("", "", True))
+        self.qc_select_filtered_button.clicked.connect(self.select_qc_filtered_bones)
+        self.qc_clear_bone_selection_button.clicked.connect(self.qc_bone_table.clearSelection)
+        self.qc_set_directional_button.clicked.connect(lambda: self.set_selected_qc_jiggle_type("Directional Jiggle"))
+        self.qc_set_omni_button.clicked.connect(lambda: self.set_selected_qc_jiggle_type("Omni Jiggle"))
+        self.qc_set_spring_button.clicked.connect(lambda: self.set_selected_qc_jiggle_type("Spring Jiggle"))
+        self.qc_set_not_jiggle_button.clicked.connect(lambda: self.set_selected_qc_jiggle_type("Not Jiggle"))
+        self.qc_reset_jiggle_params_button.clicked.connect(self.reset_selected_qc_jiggle_params)
+        self.qc_reset_physics_button.clicked.connect(self.reload_qc_physics_from_plan_defaults)
 
         self.tabs.addTab(tab, "14 Sort QC and Compile")
 
@@ -7777,6 +8274,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
             main_gmod = str(self.settings_store.value("qc_gmod_path", "", str) or "")
         if main_gmod and hasattr(self, "main_gmod_row"):
             self.main_gmod_row.set_value(main_gmod)
+        model_manager_gmod = str(self.settings_store.value("model_manager_gmod_path", "", str) or "")
+        if not model_manager_gmod:
+            model_manager_gmod = main_gmod or str(self.settings_store.value("qc_gmod_path", "", str) or "")
+        if model_manager_gmod and hasattr(self, "model_manager_gmod_row"):
+            self.model_manager_gmod_row.set_value(model_manager_gmod)
         main_model = str(self.settings_store.value("main_model_name", "", str) or "")
         if main_model and hasattr(self, "main_model_name_edit"):
             self.main_model_name_edit.setText(main_model)
@@ -7978,6 +8480,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.settings_store.setValue("main_pmx_path", str(pmx))
         if hasattr(self, "main_gmod_row"):
             self.settings_store.setValue("main_gmod_path", self.main_gmod_row.value())
+        if hasattr(self, "model_manager_gmod_row"):
+            self.settings_store.setValue("model_manager_gmod_path", self.model_manager_gmod_row.value())
         if hasattr(self, "main_model_name_edit"):
             self.settings_store.setValue("main_model_name", self.main_model_name_edit.text().strip())
         if hasattr(self, "main_category_edit"):
@@ -8518,6 +9022,245 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "Detect GMod",
             "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL." + detail,
         )
+
+    def browse_model_manager_gmod_folder(self) -> None:
+        current = self.model_manager_gmod_row.value() if hasattr(self, "model_manager_gmod_row") else ""
+        start = str(Path.home())
+        game_dir, _error = gmod_game_dir_from_path_input(current)
+        if game_dir is not None:
+            start = str(game_dir.parent)
+        elif current:
+            current_path = Path(current)
+            start = str(current_path.parent if current_path.is_file() else current_path)
+        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Garry's Mod folder", start)
+        if selected:
+            self.model_manager_gmod_row.set_value(selected)
+            self.save_settings()
+
+    def detect_gmod_for_model_manager(self) -> None:
+        candidates: list[str] = []
+        for attr in ("model_manager_gmod_row", "main_gmod_row", "qc_gmod_row"):
+            row = getattr(self, attr, None)
+            if row is not None and hasattr(row, "value"):
+                value = str(row.value()).strip()
+                if value and value not in candidates:
+                    candidates.append(value)
+        for candidate in candidates:
+            resolved = resolve_gmod_path_input(candidate)
+            if resolved.get("ok"):
+                found = str(resolved.get("display") or candidate)
+                self.model_manager_gmod_row.set_value(found)
+                self.model_manager_summary_label.setText(f"Using GMod path: {found}")
+                self.save_settings()
+                self.refresh_model_manager_models()
+                return
+        found = self.find_gmod_candidate()
+        if found:
+            self.model_manager_gmod_row.set_value(found)
+            self.model_manager_summary_label.setText(f"Detected GMod path: {found}")
+            self.save_settings()
+            self.refresh_model_manager_models()
+            return
+        self.show_error(
+            "Detect GMod",
+            "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or the Garry's Mod install folder.",
+        )
+
+    def open_model_manager_addons_folder(self) -> None:
+        addons_dir = Path(self.model_manager_addons_dir) if self.model_manager_addons_dir else None
+        if addons_dir is None or not addons_dir.exists():
+            game_dir, error = gmod_game_dir_from_path_input(self.model_manager_gmod_row.value())
+            if game_dir is None:
+                self.show_error("Open Addons Folder", error)
+                return
+            addons_dir = game_dir / "addons"
+        if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(addons_dir))):
+            self.statusBar().showMessage(str(addons_dir))
+
+    def refresh_model_manager_models(self) -> None:
+        worker = self.model_manager_scan_worker
+        if worker is not None and worker.isRunning():
+            return
+        path = self.model_manager_gmod_row.value() if hasattr(self, "model_manager_gmod_row") else ""
+        if not path.strip():
+            fallback = self.main_gmod_row.value() if hasattr(self, "main_gmod_row") else ""
+            if fallback.strip():
+                self.model_manager_gmod_row.set_value(fallback)
+                path = fallback
+        if not path.strip():
+            self.show_error("Scan Ported Models", "Select or detect a Garry's Mod path first.")
+            return
+        self.model_manager_summary_label.setText("Scanning Garry's Mod addons for importer manifests...")
+        self.model_manager_scan_button.setEnabled(False)
+        self.model_manager_remove_button.setEnabled(False)
+        worker = ModelManagerScanWorker(path)
+        self.model_manager_scan_worker = worker
+        worker.done.connect(self.on_model_manager_scan_done)
+        worker.failed.connect(self.on_model_manager_scan_failed)
+        worker.finished.connect(self.on_model_manager_scan_finished)
+        worker.start()
+
+    def on_model_manager_scan_done(self, result: dict) -> None:
+        self.model_manager_models = list(result.get("models") or [])
+        self.model_manager_addons_dir = str(result.get("addons_dir") or "")
+        self.populate_model_manager_table()
+        total_size = sum(int(model.get("size_bytes") or 0) for model in self.model_manager_models)
+        count = len(self.model_manager_models)
+        if count:
+            self.model_manager_summary_label.setText(
+                f"Found {count} tagged addon folder(s). Total size: {self.format_file_size(total_size)}. Addons folder: {self.model_manager_addons_dir}"
+            )
+        else:
+            self.model_manager_summary_label.setText(f"No tagged importer addon folders found in: {self.model_manager_addons_dir}")
+
+    def on_model_manager_scan_failed(self, message: str) -> None:
+        self.model_manager_models = []
+        self.model_manager_addons_dir = ""
+        self.populate_model_manager_table()
+        self.model_manager_summary_label.setText("Scan failed.")
+        self.show_error("Scan Ported Models", message)
+
+    def on_model_manager_scan_finished(self) -> None:
+        self.model_manager_scan_worker = None
+        self.update_model_manager_buttons()
+
+    def model_manager_item(self, text: object, model: dict[str, object] | None = None) -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(str(text or ""))
+        if model is not None:
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, model)
+        return item
+
+    def populate_model_manager_table(self) -> None:
+        table = self.model_manager_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        for model in self.model_manager_models:
+            row = table.rowCount()
+            table.insertRow(row)
+            display_names = model.get("display_names") if isinstance(model.get("display_names"), list) else []
+            manifest_ids = model.get("manifest_ids") if isinstance(model.get("manifest_ids"), list) else []
+            authors = model.get("authors") if isinstance(model.get("authors"), list) else []
+            categories = model.get("categories") if isinstance(model.get("categories"), list) else []
+            model_paths = model.get("model_paths") if isinstance(model.get("model_paths"), list) else []
+            name = ", ".join(str(item) for item in display_names) or ", ".join(str(item) for item in manifest_ids) or str(model.get("addon_name") or "")
+            modified_time = float(model.get("modified_time") or 0.0)
+            modified_text = datetime.fromtimestamp(modified_time).strftime("%Y-%m-%d %H:%M") if modified_time > 0 else ""
+            cells = [
+                name,
+                str(model.get("addon_name") or Path(str(model.get("addon_dir") or "")).name),
+                self.format_file_size(int(model.get("size_bytes") or 0)),
+                modified_text,
+                ", ".join(str(item) for item in authors),
+                ", ".join(str(item) for item in categories),
+                "\n".join(str(item) for item in model_paths),
+            ]
+            for column, cell in enumerate(cells):
+                item = self.model_manager_item(cell, model if column == 0 else None)
+                if column == 2:
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, int(model.get("size_bytes") or 0))
+                item.setToolTip(str(cell))
+                table.setItem(row, column, item)
+        table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
+        self.update_model_manager_buttons()
+
+    def selected_model_manager_models(self) -> list[dict[str, object]]:
+        table = getattr(self, "model_manager_table", None)
+        if not isinstance(table, QtWidgets.QTableWidget):
+            return []
+        selection = table.selectionModel()
+        if selection is None:
+            return []
+        models: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for index in selection.selectedRows():
+            item = table.item(index.row(), 0)
+            if item is None:
+                continue
+            model = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if not isinstance(model, dict):
+                continue
+            addon_dir = str(model.get("addon_dir") or "")
+            if addon_dir and addon_dir not in seen:
+                seen.add(addon_dir)
+                models.append(model)
+        return models
+
+    def update_model_manager_buttons(self) -> None:
+        scanning = bool(self.model_manager_scan_worker and self.model_manager_scan_worker.isRunning())
+        removing = bool(self.model_manager_remove_worker and self.model_manager_remove_worker.isRunning())
+        busy = scanning or removing
+        selected = bool(self.selected_model_manager_models())
+        for attr in ("model_manager_detect_button", "model_manager_browse_folder_button", "model_manager_scan_button", "model_manager_open_addons_button"):
+            button = getattr(self, attr, None)
+            if isinstance(button, QtWidgets.QPushButton):
+                button.setEnabled(not busy)
+        button = getattr(self, "model_manager_remove_button", None)
+        if isinstance(button, QtWidgets.QPushButton):
+            button.setEnabled(not busy and selected)
+
+    def remove_selected_model_manager_models(self) -> None:
+        selected = self.selected_model_manager_models()
+        if not selected:
+            self.statusBar().showMessage("No ported model addon folder selected.")
+            return
+        if not self.model_manager_addons_dir:
+            game_dir, error = gmod_game_dir_from_path_input(self.model_manager_gmod_row.value())
+            if game_dir is None:
+                self.show_error("Remove Selected", error)
+                return
+            self.model_manager_addons_dir = str(game_dir / "addons")
+        names = []
+        for model in selected:
+            display_names = model.get("display_names") if isinstance(model.get("display_names"), list) else []
+            name = ", ".join(str(item) for item in display_names) or str(model.get("addon_name") or model.get("addon_dir") or "")
+            names.append(f"- {name} ({self.format_file_size(int(model.get('size_bytes') or 0))})")
+        message = (
+            "Remove the selected generated addon folder(s)?\n\n"
+            + "\n".join(names[:12])
+            + ("\n..." if len(names) > 12 else "")
+            + "\n\nThis deletes the whole addon folder from Garry's Mod addons. It cannot be undone from this tool."
+        )
+        reply = QtWidgets.QMessageBox.warning(
+            self,
+            "Remove Ported Models",
+            message,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        addon_dirs = [str(model.get("addon_dir") or "") for model in selected if str(model.get("addon_dir") or "")]
+        if not addon_dirs:
+            return
+        self.model_manager_summary_label.setText("Removing selected generated addon folder(s)...")
+        worker = ModelManagerRemoveWorker(self.model_manager_addons_dir, addon_dirs)
+        self.model_manager_remove_worker = worker
+        worker.done.connect(self.on_model_manager_remove_done)
+        worker.failed.connect(self.on_model_manager_remove_failed)
+        worker.finished.connect(self.on_model_manager_remove_finished)
+        self.update_model_manager_buttons()
+        worker.start()
+
+    def on_model_manager_remove_done(self, result: dict) -> None:
+        removed = list(result.get("removed") or [])
+        failures = list(result.get("failures") or [])
+        if failures:
+            self.show_error(
+                "Remove Ported Models",
+                f"Removed {len(removed)} addon folder(s), but some items failed:\n\n" + "\n".join(str(item) for item in failures),
+            )
+        else:
+            QtWidgets.QMessageBox.information(self, "Remove Ported Models", f"Removed {len(removed)} addon folder(s).")
+        self.refresh_model_manager_models()
+
+    def on_model_manager_remove_failed(self, message: str) -> None:
+        self.model_manager_summary_label.setText("Remove failed.")
+        self.show_error("Remove Ported Models", message)
+
+    def on_model_manager_remove_finished(self) -> None:
+        self.model_manager_remove_worker = None
+        self.update_model_manager_buttons()
 
     def update_main_display_placeholders(self, default_model: str = "") -> None:
         if hasattr(self, "main_category_display_edit"):
@@ -13439,6 +14182,20 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.refresh_collision_bone_preview_state()
         self.refresh_collision_preview_state()
 
+    def refresh_collision_source_visibility_only(self) -> None:
+        if self.collision_preview is None or not self.current_collision_sources:
+            return
+        enabled = set(self.selected_collision_source_bodygroups() or [])
+        if hasattr(self.collision_preview, "set_visible_bodygroups"):
+            self.collision_preview.set_visible_bodygroups(enabled)
+        else:
+            self.refresh_collision_source_preview()
+            return
+        if self.current_collision_plan is None:
+            self.collision_preview.set_collision_overlay({})
+        self.refresh_collision_bone_preview_state()
+        self.refresh_collision_preview_state()
+
     def collision_source_highlight_uid(self, bodygroup: str) -> str:
         if not self.current_collision_sources:
             return ""
@@ -13479,6 +14236,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def on_collision_source_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         if self._updating_collision_source_table or not self.current_collision_sources:
             return
+        if item.column() != 0:
+            return
         name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
         for entry in self.collision_source_entries():
             if str(entry.get("name") or "") == name:
@@ -13490,7 +14249,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.collision_table.setRowCount(0)
             self.collision_apply_button.setEnabled(False)
             self.collision_validate_button.setEnabled(False)
-        self.refresh_collision_source_preview()
+        self.refresh_collision_source_visibility_only()
         self.update_collision_summary()
 
     def start_collision_analyze(self) -> None:
@@ -13969,10 +14728,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
             ("Opening proportion trick template", 54, "Opening Proportion Template", "#58a6ff"),
             ("Importing raw Body.smd", 60, "Importing Raw Body", "#58a6ff"),
             ("Importing raw SMD", 66, "Importing Raw SMDs", "#58a6ff"),
-            ("Importing raw VTA", 70, "Importing Raw VTAs", "#58a6ff"),
+            ("Skipping raw VTA import", 70, "Skipping Raw VTA Import", "#58a6ff"),
             ("Running Proportion Trick Full", 78, "Running Proportion Trick", "#d29922"),
             ("Exporting final Source files", 88, "Final Source Export", "#58a6ff"),
-            ("Replacing final VTA", 94, "Replacing VTA Files", "#d29922"),
+            ("Copying raw VTA", 94, "Copying VTA Files", "#d29922"),
             ("Wrote proportion export report", 98, "Writing Report", "#2ea043"),
             ("Blender proportion export finished", 100, "Step 9 Complete", "#2ea043"),
         ]
@@ -14426,6 +15185,78 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def workspace_cache_cleanup_finished(self) -> None:
         self.workspace_cleanup_worker = None
         self.update_workspace_cache_size_label()
+
+    def delete_managed_blender_cache(self) -> None:
+        if self.worker and self.worker.isRunning():
+            self.show_error(
+                self._t("main.delete_blender_cache_title", "Delete local Blender"),
+                self._t("main.delete_blender_cache_busy", "Wait for the current workflow step to finish before deleting local Blender."),
+            )
+            return
+        if self.managed_blender_delete_worker and self.managed_blender_delete_worker.isRunning():
+            return
+        blender_root = core.software_blender_root()
+        setup_state = core.setup_state_path()
+        message = self._t(
+            "main.delete_blender_cache_confirm",
+            "This will delete the importer-managed local Blender folder and setup state:\n{path}\n\n"
+            "System Blender installs are not affected. The next port will reinstall bundled Blender and add-ons.\n\nContinue?",
+            path=str(blender_root),
+        )
+        reply = QtWidgets.QMessageBox.warning(
+            self,
+            self._t("main.delete_blender_cache_title", "Delete local Blender"),
+            message,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        button = getattr(self, "main_delete_blender_cache_button", None)
+        if isinstance(button, QtWidgets.QPushButton):
+            button.setEnabled(False)
+        self.statusBar().showMessage(self._t("main.delete_blender_cache_running", "Deleting local Blender cache..."))
+        self.append_main_log(f"Deleting managed Blender cache: {blender_root}")
+        self.append_main_log(f"Deleting managed Blender setup state if present: {setup_state}")
+        worker = ManagedBlenderDeleteWorker()
+        self.managed_blender_delete_worker = worker
+        worker.done.connect(self.managed_blender_cache_deleted)
+        worker.failed.connect(self.managed_blender_cache_delete_failed)
+        worker.finished.connect(self.managed_blender_cache_delete_finished)
+        worker.start()
+
+    def managed_blender_cache_deleted(self, result: dict) -> None:
+        removed_blender = bool(result.get("removed_blender")) if isinstance(result, dict) else False
+        removed_state = bool(result.get("removed_state")) if isinstance(result, dict) else False
+        size = int(result.get("size_bytes", 0) or 0) if isinstance(result, dict) else 0
+        root = str(result.get("blender_root") or core.software_blender_root()) if isinstance(result, dict) else str(core.software_blender_root())
+        if removed_blender or removed_state:
+            message = self._t(
+                "main.delete_blender_cache_complete",
+                "Local Blender cache deleted. The next port will reinstall bundled Blender.",
+            )
+            self.statusBar().showMessage(message)
+            self.append_main_log(
+                self._t(
+                    "main.delete_blender_cache_log_complete",
+                    "Deleted local Blender cache: {path} ({size})",
+                    path=root,
+                    size=self.format_file_size(size),
+                )
+            )
+        else:
+            message = self._t("main.delete_blender_cache_empty", "No local Blender cache was found.")
+            self.statusBar().showMessage(message)
+            self.append_main_log(f"{message} {root}")
+
+    def managed_blender_cache_delete_failed(self, message: str) -> None:
+        self.show_error(self._t("main.delete_blender_cache_failed", "Local Blender cleanup failed"), message)
+
+    def managed_blender_cache_delete_finished(self) -> None:
+        self.managed_blender_delete_worker = None
+        button = getattr(self, "main_delete_blender_cache_button", None)
+        if isinstance(button, QtWidgets.QPushButton):
+            button.setEnabled(True)
 
     def set_proportion_outputs_visible(self, visible: bool) -> None:
         self.proportion_output_group.setVisible(bool(visible))
@@ -16643,6 +17474,354 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.set_qc_progress(value, title, message, color)
                 return
 
+    def make_qc_double_spin(self, minimum: float, maximum: float, decimals: int = 2, step: float = 1.0) -> QtWidgets.QDoubleSpinBox:
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setRange(float(minimum), float(maximum))
+        spin.setDecimals(int(decimals))
+        spin.setSingleStep(float(step))
+        spin.setKeyboardTracking(False)
+        spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        return spin
+
+    def set_qc_advanced_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if hasattr(self, "qc_advanced_panel"):
+            self.qc_advanced_panel.setVisible(visible)
+        if hasattr(self, "qc_advanced_toggle"):
+            self.qc_advanced_toggle.setText(
+                "Hide Advanced Jiggle / Physics Controls" if visible else "Show Advanced Jiggle / Physics Controls"
+            )
+            icon = QtWidgets.QStyle.StandardPixmap.SP_ArrowDown if visible else QtWidgets.QStyle.StandardPixmap.SP_ArrowForward
+            self.qc_advanced_toggle.setIcon(self.style().standardIcon(icon))
+
+    def qc_default_jiggle_params(self, jiggle_type: str) -> dict[str, float]:
+        kind = str(jiggle_type or "Directional Jiggle")
+        if kind == "Spring Jiggle":
+            return {
+                "length": 15.0,
+                "tip_mass": 30.0,
+                "pitch_stiffness": 40.0,
+                "pitch_damping": 5.0,
+                "yaw_stiffness": 40.0,
+                "yaw_damping": 3.0,
+                "along_stiffness": 100.0,
+                "along_damping": 0.0,
+                "angle_constraint": 14.0,
+            }
+        if kind == "Omni Jiggle":
+            return {
+                "length": 15.0,
+                "tip_mass": 0.0,
+                "pitch_stiffness": 10.0,
+                "pitch_damping": 2.0,
+                "yaw_stiffness": 10.0,
+                "yaw_damping": 2.0,
+                "along_stiffness": 100.0,
+                "along_damping": 0.0,
+                "angle_constraint": 30.0,
+            }
+        return {
+            "length": 10.0,
+            "tip_mass": 100.0,
+            "pitch_stiffness": 25.0,
+            "pitch_damping": 2.0,
+            "yaw_stiffness": 25.0,
+            "yaw_damping": 2.0,
+            "along_stiffness": 50.0,
+            "along_damping": 1.0,
+            "angle_constraint": 90.0,
+        }
+
+    def qc_entries_by_bone(self) -> dict[str, dict[str, object]]:
+        return {str(entry.get("bone") or ""): entry for entry in self.qc_entries() if str(entry.get("bone") or "")}
+
+    def qc_children_by_parent(self) -> dict[str, list[str]]:
+        children: dict[str, list[str]] = {}
+        for entry in self.qc_entries():
+            bone = str(entry.get("bone") or "")
+            parent = str(entry.get("parent") or "")
+            if bone and parent:
+                children.setdefault(parent, []).append(bone)
+        return children
+
+    def qc_descendants_for_roots(self, roots: set[str]) -> set[str]:
+        children = self.qc_children_by_parent()
+        out: set[str] = set()
+        stack = list(roots)
+        while stack:
+            bone = stack.pop()
+            if bone in out:
+                continue
+            out.add(bone)
+            stack.extend(children.get(bone, []))
+        return out
+
+    def qc_filter_terms(self, text: str) -> list[str]:
+        return [term.strip().lower() for term in re.split(r"[,;\s]+", str(text or "")) if term.strip()]
+
+    def qc_filtered_bones(self) -> set[str]:
+        rows = self.qc_entries()
+        if not rows:
+            return set()
+        all_bones = {str(entry.get("bone") or "") for entry in rows if str(entry.get("bone") or "")}
+        keyword_terms = self.qc_filter_terms(self.qc_filter_keyword_edit.text() if hasattr(self, "qc_filter_keyword_edit") else "")
+        root_terms = self.qc_filter_terms(self.qc_filter_root_edit.text() if hasattr(self, "qc_filter_root_edit") else "")
+        keyword_matches = all_bones
+        if keyword_terms:
+            keyword_matches = {
+                bone
+                for bone in all_bones
+                if any(term in bone.lower() for term in keyword_terms)
+            }
+        root_matches = all_bones
+        if root_terms:
+            roots = {
+                bone
+                for bone in all_bones
+                if any(term == bone.lower() or term in bone.lower() for term in root_terms)
+            }
+            root_matches = self.qc_descendants_for_roots(roots) if self.qc_filter_descendants_check.isChecked() else roots
+        if not keyword_terms and not root_terms:
+            return set()
+        return keyword_matches & root_matches
+
+    def set_qc_bone_filter(self, keywords: str, roots: str, include_descendants: bool = True) -> None:
+        self.qc_filter_keyword_edit.setText(keywords)
+        self.qc_filter_root_edit.setText(roots)
+        self.qc_filter_descendants_check.setChecked(bool(include_descendants))
+        self.update_qc_filter_status()
+
+    def update_qc_filter_status(self) -> None:
+        if not hasattr(self, "qc_filter_status_label"):
+            return
+        matches = self.qc_filtered_bones()
+        selected = len(self.selected_qc_bone_uids()) if hasattr(self, "qc_bone_table") else 0
+        if not self.current_qc_plan:
+            self.qc_filter_status_label.setText("Run Analyze QC, then filter or select bones.")
+        elif matches:
+            self.qc_filter_status_label.setText(f"Filter matches {len(matches):,} bone(s). Selected rows: {selected:,}.")
+        else:
+            self.qc_filter_status_label.setText(f"No active filter match. Selected rows: {selected:,}.")
+
+    def select_qc_filtered_bones(self) -> None:
+        matches = self.qc_filtered_bones()
+        if not matches:
+            self.qc_filter_status_label.setText("No filtered bones to select. Enter a keyword/root filter or use a preset.")
+            return
+        table = self.qc_bone_table
+        table.clearSelection()
+        selection = table.selectionModel()
+        if selection is None:
+            return
+        flags = QtCore.QItemSelectionModel.SelectionFlag.Select | QtCore.QItemSelectionModel.SelectionFlag.Rows
+        for row in range(table.rowCount()):
+            item = table.item(row, 1)
+            if item and item.text().strip() in matches:
+                selection.select(table.model().index(row, 0), flags)
+        self.update_qc_filter_status()
+
+    def selected_qc_entries(self) -> list[dict[str, object]]:
+        selected = self.selected_qc_bone_uids()
+        return [entry for entry in self.qc_entries() if str(entry.get("bone") or "") in selected]
+
+    def set_selected_qc_jiggle_type(self, jiggle_type: str) -> None:
+        selected = self.selected_qc_bone_uids()
+        if not selected:
+            self.qc_filter_status_label.setText("Select one or more bones before assigning a jiggle type.")
+            return
+        changed = 0
+        for row in range(self.qc_bone_table.rowCount()):
+            bone_item = self.qc_bone_table.item(row, 1)
+            bone = bone_item.text().strip() if bone_item else ""
+            if bone not in selected:
+                continue
+            entry = self.qc_entries_by_bone().get(bone)
+            if not entry or bool(entry.get("essential", False)):
+                continue
+            entry["jiggle_type"] = jiggle_type
+            entry["jiggle_params"] = self.qc_default_jiggle_params(jiggle_type)
+            entry.pop("jiggle_constraint_overrides", None)
+            combo = self.qc_bone_table.cellWidget(row, 0)
+            if isinstance(combo, QtWidgets.QComboBox):
+                combo.setCurrentText(jiggle_type)
+            changed += 1
+        self.sync_qc_jiggle_controls_from_selection()
+        self.update_qc_summary()
+        self.qc_filter_status_label.setText(f"Updated {changed:,} selected editable bone(s) to {jiggle_type}.")
+
+    def reset_selected_qc_jiggle_params(self) -> None:
+        changed = 0
+        for entry in self.selected_qc_entries():
+            if bool(entry.get("essential", False)):
+                continue
+            jiggle_type = str(entry.get("jiggle_type") or "Directional Jiggle")
+            entry["jiggle_params"] = self.qc_default_jiggle_params(jiggle_type)
+            entry.pop("jiggle_constraint_overrides", None)
+            changed += 1
+        self.sync_qc_jiggle_controls_from_selection()
+        self.update_qc_summary()
+        self.qc_filter_status_label.setText(f"Reset jiggle parameters for {changed:,} selected editable bone(s).")
+
+    def qc_float_list_pair(self, value: object, fallback: tuple[float, float]) -> list[float]:
+        if isinstance(value, list) and len(value) >= 2:
+            try:
+                return [float(value[0]), float(value[1])]
+            except Exception:
+                pass
+        return [float(fallback[0]), float(fallback[1])]
+
+    def sync_qc_jiggle_controls_from_selection(self) -> None:
+        if not hasattr(self, "qc_jiggle_param_spins"):
+            return
+        editable = [entry for entry in self.selected_qc_entries() if not bool(entry.get("essential", False))]
+        self._updating_qc_jiggle_controls = True
+        try:
+            enabled = bool(editable)
+            for spin in self.qc_jiggle_param_spins.values():
+                spin.setEnabled(enabled)
+            if not editable:
+                return
+            entry = editable[0]
+            jiggle_type = str(entry.get("jiggle_type") or "Directional Jiggle")
+            params = self.qc_default_jiggle_params(jiggle_type)
+            raw_params = entry.get("jiggle_params")
+            if isinstance(raw_params, dict):
+                for key, value in raw_params.items():
+                    if key in params:
+                        try:
+                            params[key] = float(value)
+                        except Exception:
+                            pass
+            pitch = self.qc_float_list_pair(entry.get("pitch_constraint"), (-10.0, 10.0))
+            yaw = self.qc_float_list_pair(entry.get("yaw_constraint"), (-10.0, 10.0))
+            values = {"pitch_min": pitch[0], "pitch_max": pitch[1], "yaw_min": yaw[0], "yaw_max": yaw[1], **params}
+            for key, spin in self.qc_jiggle_param_spins.items():
+                spin.setValue(float(values.get(key, 0.0)))
+        finally:
+            self._updating_qc_jiggle_controls = False
+
+    def on_qc_jiggle_param_changed(self, value: float) -> None:
+        if self._updating_qc_jiggle_controls:
+            return
+        spin = self.sender()
+        key = str(spin.property("qc_param_key") or "") if isinstance(spin, QtWidgets.QDoubleSpinBox) else ""
+        if not key:
+            return
+        for entry in self.selected_qc_entries():
+            if bool(entry.get("essential", False)):
+                continue
+            if key in {"pitch_min", "pitch_max"}:
+                pair = self.qc_float_list_pair(entry.get("pitch_constraint"), (-10.0, 10.0))
+                pair[0 if key == "pitch_min" else 1] = float(value)
+                entry["pitch_constraint"] = pair
+                entry["jiggle_constraint_overrides"] = True
+            elif key in {"yaw_min", "yaw_max"}:
+                pair = self.qc_float_list_pair(entry.get("yaw_constraint"), (-10.0, 10.0))
+                pair[0 if key == "yaw_min" else 1] = float(value)
+                entry["yaw_constraint"] = pair
+                entry["jiggle_constraint_overrides"] = True
+            else:
+                params = entry.get("jiggle_params")
+                if not isinstance(params, dict):
+                    params = self.qc_default_jiggle_params(str(entry.get("jiggle_type") or "Directional Jiggle"))
+                    entry["jiggle_params"] = params
+                params[key] = float(value)
+        self.update_qc_summary()
+
+    def qc_physics_rows(self) -> list[dict[str, object]]:
+        if not self.current_qc_plan:
+            return []
+        rows = self.current_qc_plan.get("physics_rows", [])
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def physics_constraint_for_gui(self, row: dict[str, object], axis: str) -> dict[str, float]:
+        constraints = row.setdefault("constraints", {})
+        if not isinstance(constraints, dict):
+            constraints = {}
+            row["constraints"] = constraints
+        value = constraints.setdefault(axis, {"min": 0.0, "max": 0.0, "friction": 0.0})
+        if not isinstance(value, dict):
+            value = {"min": 0.0, "max": 0.0, "friction": 0.0}
+            constraints[axis] = value
+        return {
+            "min": float(value.get("min", 0.0) or 0.0),
+            "max": float(value.get("max", 0.0) or 0.0),
+            "friction": float(value.get("friction", 0.0) or 0.0),
+        }
+
+    def make_qc_physics_spin(self, row_index: int, key: str, value: float, minimum: float, maximum: float) -> QtWidgets.QDoubleSpinBox:
+        spin = self.make_qc_double_spin(minimum, maximum, 3, 1.0)
+        spin.setValue(float(value))
+        spin.setProperty("physics_row", row_index)
+        spin.setProperty("physics_key", key)
+        spin.valueChanged.connect(self.on_qc_physics_value_changed)
+        return spin
+
+    def populate_qc_physics_table(self) -> None:
+        if not hasattr(self, "qc_physics_table"):
+            return
+        rows = self.qc_physics_rows()
+        if self.current_qc_plan is not None and rows and not isinstance(self.current_qc_plan.get("physics_rows_default"), list):
+            self.current_qc_plan["physics_rows_default"] = deepcopy(rows)
+        self._updating_qc_physics_table = True
+        try:
+            table = self.qc_physics_table
+            table.setRowCount(len(rows))
+            for row_index, entry in enumerate(rows):
+                bone = str(entry.get("bone") or "")
+                bone_item = QtWidgets.QTableWidgetItem(bone)
+                bone_item.setFlags(bone_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                bone_item.setToolTip(bone)
+                table.setItem(row_index, 0, bone_item)
+                table.setCellWidget(row_index, 1, self.make_qc_physics_spin(row_index, "mass_bias", float(entry.get("mass_bias", 0.0) or 0.0), 0.0, 10000.0))
+                table.setCellWidget(row_index, 2, self.make_qc_physics_spin(row_index, "rot_damping", float(entry.get("rot_damping", 0.0) or 0.0), 0.0, 10000.0))
+                column = 3
+                for axis in ("x", "y", "z"):
+                    constraint = self.physics_constraint_for_gui(entry, axis)
+                    table.setCellWidget(row_index, column, self.make_qc_physics_spin(row_index, f"{axis}.min", constraint["min"], -360.0, 360.0))
+                    table.setCellWidget(row_index, column + 1, self.make_qc_physics_spin(row_index, f"{axis}.max", constraint["max"], -360.0, 360.0))
+                    table.setCellWidget(row_index, column + 2, self.make_qc_physics_spin(row_index, f"{axis}.friction", constraint["friction"], 0.0, 10000.0))
+                    column += 3
+            table.resizeColumnsToContents()
+        finally:
+            self._updating_qc_physics_table = False
+
+    def on_qc_physics_value_changed(self, value: float) -> None:
+        if self._updating_qc_physics_table:
+            return
+        spin = self.sender()
+        if not isinstance(spin, QtWidgets.QDoubleSpinBox):
+            return
+        row_index = int(spin.property("physics_row") or -1)
+        key = str(spin.property("physics_key") or "")
+        rows = self.qc_physics_rows()
+        if row_index < 0 or row_index >= len(rows) or not key:
+            return
+        row = rows[row_index]
+        if key == "mass_bias":
+            row["mass_bias"] = float(value)
+            row["has_mass_bias"] = True
+        elif key == "rot_damping":
+            row["rot_damping"] = float(value)
+            row["has_rot_damping"] = True
+        elif "." in key:
+            axis, field = key.split(".", 1)
+            constraint = self.physics_constraint_for_gui(row, axis)
+            constraint[field] = float(value)
+            constraints = row.setdefault("constraints", {})
+            if isinstance(constraints, dict):
+                constraints[axis] = constraint
+        self.update_qc_summary()
+
+    def reload_qc_physics_from_plan_defaults(self) -> None:
+        if not self.current_qc_plan:
+            return
+        defaults = self.current_qc_plan.get("physics_rows_default")
+        if isinstance(defaults, list):
+            self.current_qc_plan["physics_rows"] = deepcopy(defaults)
+            self.populate_qc_physics_table()
+            self.update_qc_summary()
+
     def qc_safe_text(self, text: str, fallback: str = "") -> str:
         text = re.sub(r"[^A-Za-z_]+", "_", text.strip())
         text = re.sub(r"_+", "_", text).strip("_")
@@ -16675,6 +17854,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_compile_button.setEnabled(False)
         self.qc_bone_table.setRowCount(0)
         self.qc_files_table.setRowCount(0)
+        if hasattr(self, "qc_physics_table"):
+            self.qc_physics_table.setRowCount(0)
         if self.qc_preview is not None:
             self.qc_preview.clear()
         if value.strip():
@@ -16839,6 +18020,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_log.clear()
         self.qc_bone_table.setRowCount(0)
         self.qc_files_table.setRowCount(0)
+        if hasattr(self, "qc_physics_table"):
+            self.qc_physics_table.setRowCount(0)
         if self.qc_preview is not None:
             self.qc_preview.clear()
         self.set_step_working(14, "Preparing Step 14 QC analysis")
@@ -16996,6 +18179,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.qc_bone_table.setItem(row_index, column, item)
         self._updating_qc_table = False
         self.qc_bone_table.resizeRowsToContents()
+        self.populate_qc_physics_table()
+        self.sync_qc_jiggle_controls_from_selection()
+        self.update_qc_filter_status()
 
     def on_qc_type_changed(self, text: str) -> None:
         if self._updating_qc_table or not self.current_qc_plan:
@@ -17009,10 +18195,16 @@ class ImporterWindow(QtWidgets.QMainWindow):
             entry["jiggle_type"] = "Not Jiggle"
             return
         entry["jiggle_type"] = text
+        entry["jiggle_params"] = self.qc_default_jiggle_params(text)
+        entry.pop("jiggle_constraint_overrides", None)
+        self.sync_qc_jiggle_controls_from_selection()
         self.update_qc_summary()
 
     def selected_qc_bone_uids(self) -> set[str]:
-        rows = sorted({index.row() for index in self.qc_bone_table.selectionModel().selectedRows()})
+        selection = self.qc_bone_table.selectionModel()
+        if selection is None:
+            return set()
+        rows = sorted({index.row() for index in selection.selectedRows()})
         out: set[str] = set()
         for row in rows:
             item = self.qc_bone_table.item(row, 1)
@@ -17039,6 +18231,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
     def on_qc_bone_selection_changed(self) -> None:
         self.refresh_qc_preview_state()
+        self.sync_qc_jiggle_controls_from_selection()
+        self.update_qc_filter_status()
 
     def refresh_qc_preview(self) -> None:
         if self.qc_preview is None:
@@ -17080,6 +18274,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         self.qc_summary_label.setText(
             f"Bones: {len(rows):,} | Jigglebones: {len(jiggles):,} | Omni ignore: {len(omni):,} | "
+            f"Physics joints: {len(self.qc_physics_rows()):,} | "
             f"Jiggle direction: {'inverted' if invert else 'normal'} | "
             f"MCI metadata: {'included' if include_metadata else 'skipped'} | "
             f"Warnings: {warnings:,} | Validation: {'OK' if not errors else f'{len(errors)} issue(s)'}"
@@ -17135,6 +18330,29 @@ class ImporterWindow(QtWidgets.QMainWindow):
         for row in self.qc_entries():
             if row.get("essential", False) and str(row.get("jiggle_type") or "") != "Not Jiggle":
                 errors.append(f"Essential bone cannot be jigglebone: {row.get('bone')}")
+            bone = str(row.get("bone") or "")
+            for key, label in (("pitch_constraint", "pitch"), ("yaw_constraint", "yaw")):
+                values = row.get(key)
+                if isinstance(values, list) and len(values) >= 2:
+                    try:
+                        if float(values[0]) > float(values[1]):
+                            errors.append(f"{bone} {label} constraint minimum must be less than or equal to maximum.")
+                    except Exception:
+                        errors.append(f"{bone} {label} constraint must be numeric.")
+        for row in self.qc_physics_rows():
+            bone = str(row.get("bone") or "")
+            constraints = row.get("constraints")
+            if not isinstance(constraints, dict):
+                continue
+            for axis in ("x", "y", "z"):
+                value = constraints.get(axis)
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    if float(value.get("min", 0.0)) > float(value.get("max", 0.0)):
+                        errors.append(f"{bone} physics {axis.upper()} minimum must be less than or equal to maximum.")
+                except Exception:
+                    errors.append(f"{bone} physics {axis.upper()} constraint must be numeric.")
         return errors
 
     def update_qc_plan_from_gui(self) -> dict[str, object] | None:

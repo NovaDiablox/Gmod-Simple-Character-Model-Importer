@@ -30,6 +30,15 @@ except ModuleNotFoundError:
     from . import mmd_character_importer_core as core  # type: ignore[no-redef]
 
 
+BONE_LINE_WIDTH = 2.2
+BONE_POINT_RADIUS = 3.2
+BONE_OVERLAY_LINE_WIDTH = 2.6
+BONE_OVERLAY_POINT_SIZE = 5.0
+BONE_HIGHLIGHT_LINE_WIDTH = 6.0
+BONE_HIGHLIGHT_POINT_RADIUS = 8.0
+BONE_HIGHLIGHT_POINT_SIZE = 10.0
+
+
 def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -248,6 +257,11 @@ def load_static_preview_model(model_path: Path) -> StaticPreviewModel:
         reader.read_string(encoding)
 
         vertex_count = reader.read_i32()
+        if vertex_count > core.MAX_SUPPORTED_PMX_VERTEX_COUNT:
+            raise RuntimeError(
+                f"PMX vertex count {vertex_count:,} exceeds the supported limit of "
+                f"{core.MAX_SUPPORTED_PMX_VERTEX_COUNT:,}. This model is too large for the importer."
+            )
         positions = np.zeros((vertex_count, 3), dtype=np.float32)
         normals = np.zeros((vertex_count, 3), dtype=np.float32)
         uvs = np.zeros((vertex_count, 2), dtype=np.float32)
@@ -615,15 +629,15 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         positions = np.array([bone.position for bone in self.model.bones], dtype=np.float64)
         points = self._project_np(positions)
         if self._show_bones:
-            painter.setPen(QtGui.QPen(QtGui.QColor(80, 170, 255, 170), 1))
+            painter.setPen(QtGui.QPen(QtGui.QColor(80, 170, 255, 220), BONE_LINE_WIDTH))
             for index, bone in enumerate(self.model.bones):
                 if 0 <= bone.parent < len(points):
                     painter.drawLine(points[bone.parent], points[index])
             painter.setBrush(QtGui.QColor(245, 245, 245, 180))
-            painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20, 160), 1))
+            painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20, 180), 1.4))
             stride = max(1, len(points) // 90)
             for point in points[::stride]:
-                painter.drawEllipse(point, 2.0, 2.0)
+                painter.drawEllipse(point, BONE_POINT_RADIUS, BONE_POINT_RADIUS)
         if self._show_bone_names:
             old_font = painter.font()
             font = QtGui.QFont(old_font)
@@ -990,7 +1004,7 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
         edges = preview.get("edges")
         painter.setPen(QtGui.QPen(QtGui.QColor(160, 170, 185, 38), 1))
         if isinstance(edges, list):
-            for raw_edge in edges[:8000]:
+            for raw_edge in edges:
                 if not isinstance(raw_edge, list) or len(raw_edge) < 2:
                     continue
                 a = int(raw_edge[0])
@@ -1012,7 +1026,7 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
                 vectors.append(np.array(head[:3], dtype=np.float64))
         projected = self._project_np(np.vstack(vectors)) if vectors else []
         points.update(zip(names, projected))
-        painter.setPen(QtGui.QPen(QtGui.QColor(120, 128, 138, 95), 1))
+        painter.setPen(QtGui.QPen(QtGui.QColor(130, 142, 156, 150), BONE_LINE_WIDTH))
         for name, bone in self._bones.items():
             parent = bone.get("parent")
             if parent in points and name in points:
@@ -1045,8 +1059,8 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
             if point is None:
                 continue
             painter.setBrush(color)
-            painter.setPen(QtGui.QPen(QtGui.QColor(15, 15, 15), 1))
-            painter.drawEllipse(point, 4.0, 4.0)
+            painter.setPen(QtGui.QPen(QtGui.QColor(15, 15, 15), 1.4))
+            painter.drawEllipse(point, BONE_POINT_RADIUS + 1.4, BONE_POINT_RADIUS + 1.4)
 
     def _draw_target_chain(self, painter: QtGui.QPainter) -> None:
         chain = ["ValveBiped.Bip01_Pelvis", "ValveBiped.Bip01_Spine", "ValveBiped.Bip01_Spine1", "ValveBiped.Bip01_Spine2", "ValveBiped.Bip01_Spine4"]
@@ -1055,16 +1069,16 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
         for index in range(len(points) - 1):
             if points[index] is None or points[index + 1] is None:
                 continue
-            painter.setPen(QtGui.QPen(colors[min(index, len(colors) - 1)], 3))
+            painter.setPen(QtGui.QPen(colors[min(index, len(colors) - 1)], BONE_HIGHLIGHT_LINE_WIDTH - 1.0))
             painter.drawLine(points[index], points[index + 1])
-        painter.setPen(QtGui.QPen(QtGui.QColor(245, 245, 245), 1))
+        painter.setPen(QtGui.QPen(QtGui.QColor(245, 245, 245), 1.4))
         for target, point in zip(chain, points):
             if point is None:
                 continue
             entry = self._target_entries().get(target, {})
             action = str(entry.get("action") or "")
             painter.setBrush(QtGui.QColor(255, 210, 120) if action == "add" else QtGui.QColor(235, 235, 235))
-            painter.drawEllipse(point, 4.5, 4.5)
+            painter.drawEllipse(point, BONE_POINT_RADIUS + 1.8, BONE_POINT_RADIUS + 1.8)
             painter.drawText(QtCore.QPointF(point.x() + 6.0, point.y() - 5.0), target.rsplit("_", 1)[-1])
         for target, entry in self._target_entries().items():
             if str(entry.get("action")) != "add":
@@ -1073,7 +1087,7 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
             tail = self._project_one(self._vector_for_target(target, "tail"))
             if head is None or tail is None:
                 continue
-            pen = QtGui.QPen(QtGui.QColor(255, 210, 120), 2)
+            pen = QtGui.QPen(QtGui.QColor(255, 210, 120), BONE_LINE_WIDTH + 0.8)
             pen.setStyle(QtCore.Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.drawLine(head, tail)
@@ -1105,20 +1119,20 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
             target_point = points.get(target)
             if source_point is None or target_point is None:
                 continue
-            pen = QtGui.QPen(QtGui.QColor(145, 150, 160, 80), 1.2)
+            pen = QtGui.QPen(QtGui.QColor(145, 150, 160, 120), BONE_LINE_WIDTH)
             pen.setStyle(QtCore.Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.drawLine(source_point, target_point)
-            painter.setPen(QtGui.QPen(QtGui.QColor(145, 150, 160, 130), 1))
+            painter.setPen(QtGui.QPen(QtGui.QColor(145, 150, 160, 170), 1.6))
             painter.drawLine(QtCore.QPointF(source_point.x() - 3, source_point.y() - 3), QtCore.QPointF(source_point.x() + 3, source_point.y() + 3))
             painter.drawLine(QtCore.QPointF(source_point.x() - 3, source_point.y() + 3), QtCore.QPointF(source_point.x() + 3, source_point.y() - 3))
 
-        painter.setPen(QtGui.QPen(QtGui.QColor(87, 171, 90, 210), 2))
+        painter.setPen(QtGui.QPen(QtGui.QColor(87, 171, 90, 230), BONE_LINE_WIDTH + 0.8))
         painter.setBrush(QtGui.QColor(87, 171, 90, 190))
         for name in protected:
             point = points.get(name)
             if point is not None:
-                painter.drawEllipse(point, 3.5, 3.5)
+                painter.drawEllipse(point, BONE_POINT_RADIUS + 0.8, BONE_POINT_RADIUS + 0.8)
 
         for entry in enabled_ops[:140]:
             source = str(entry.get("source") or "")
@@ -1129,16 +1143,16 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
                 continue
             round_index = int(entry.get("round", 0) or 0)
             color = QtGui.QColor(255, 158, 77, 180) if round_index else QtGui.QColor(255, 220, 112, 210)
-            pen = QtGui.QPen(color, 1.8)
+            pen = QtGui.QPen(color, BONE_LINE_WIDTH + 0.8)
             if round_index == 0:
                 pen.setStyle(QtCore.Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.drawLine(source_point, target_point)
             painter.setBrush(QtGui.QColor(248, 81, 73, 220))
-            painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20), 1))
-            painter.drawEllipse(source_point, 3.2, 3.2)
+            painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20), 1.4))
+            painter.drawEllipse(source_point, BONE_POINT_RADIUS + 0.8, BONE_POINT_RADIUS + 0.8)
             painter.setBrush(QtGui.QColor(163, 113, 247, 220))
-            painter.drawEllipse(target_point, 3.8, 3.8)
+            painter.drawEllipse(target_point, BONE_POINT_RADIUS + 1.2, BONE_POINT_RADIUS + 1.2)
 
         if len(enabled_ops) > 140:
             painter.setPen(QtGui.QColor(255, 210, 120))
@@ -1174,12 +1188,12 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
             return
         parent = self._bones[self._hovered_bone].get("parent")
         parent_point = points.get(str(parent)) if parent else None
-        painter.setPen(QtGui.QPen(QtGui.QColor(255, 230, 120), 4))
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 230, 120), BONE_HIGHLIGHT_LINE_WIDTH))
         if parent_point is not None:
             painter.drawLine(parent_point, point)
         painter.setBrush(QtGui.QColor(255, 230, 120))
-        painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20), 1))
-        painter.drawEllipse(point, 6.0, 6.0)
+        painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20), 1.6))
+        painter.drawEllipse(point, BONE_HIGHLIGHT_POINT_RADIUS, BONE_HIGHLIGHT_POINT_RADIUS)
         text = self._hovered_bone
         metrics = painter.fontMetrics()
         rect = metrics.boundingRect(text).adjusted(-6, -4, 6, 4)
@@ -1492,6 +1506,24 @@ class MaterialPreviewWidget(QOpenGLWidget):
         entry.update(updates)
         self.update()
         self._emit_stats()
+
+    def set_visible_bodygroups(self, bodygroups: set[str] | list[str] | tuple[str, ...]) -> None:
+        enabled = {str(name) for name in bodygroups if str(name)}
+        changed = False
+        for entry in self._materials.values():
+            bodygroup = str(entry.get("bodygroup") or "")
+            if not bodygroup:
+                continue
+            keep = bodygroup in enabled
+            if bool(entry.get("keep", True)) != keep:
+                entry["keep"] = keep
+                changed = True
+            if not bool(entry.get("render_when_highlighted", False)):
+                entry["render_when_highlighted"] = True
+                changed = True
+        if changed:
+            self.update()
+            self._emit_stats()
 
     def set_model_preview_data(self, model_preview: dict[str, object] | None) -> None:
         if not self.scan:
@@ -2195,22 +2227,27 @@ class MaterialPreviewWidget(QOpenGLWidget):
         GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
         GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
         GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glLineWidth(1.2)
+        GL.glLineWidth(BONE_OVERLAY_LINE_WIDTH)
+        GL.glPointSize(BONE_OVERLAY_POINT_SIZE)
         for uid, lines in self._bone_lines.items():
             if len(lines) < 2:
                 continue
             highlighted = uid == self._hovered_bone_uid or uid in self._highlighted_bone_uids
             if highlighted:
                 GL.glDisable(GL.GL_DEPTH_TEST)
-                GL.glLineWidth(3.0)
+                GL.glLineWidth(BONE_HIGHLIGHT_LINE_WIDTH)
+                GL.glPointSize(BONE_HIGHLIGHT_POINT_SIZE)
                 GL.glColor4f(1.0, 0.72, 0.05, 1.0)
             else:
                 GL.glEnable(GL.GL_DEPTH_TEST)
-                GL.glLineWidth(1.2)
-                GL.glColor4f(0.72, 0.78, 0.86, 0.72)
+                GL.glLineWidth(BONE_OVERLAY_LINE_WIDTH)
+                GL.glPointSize(BONE_OVERLAY_POINT_SIZE)
+                GL.glColor4f(0.78, 0.84, 0.94, 0.86)
             GL.glVertexPointer(3, GL.GL_FLOAT, 0, ctypes.c_void_p(int(lines.ctypes.data)))
             GL.glDrawArrays(GL.GL_LINES, 0, int(len(lines)))
+            GL.glDrawArrays(GL.GL_POINTS, 0, int(len(lines)))
         GL.glLineWidth(1.0)
+        GL.glPointSize(1.0)
         GL.glEnable(GL.GL_DEPTH_TEST)
 
     def _draw_overlay(self, painter: QtGui.QPainter) -> None:

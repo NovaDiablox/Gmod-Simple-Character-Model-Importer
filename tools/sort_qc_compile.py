@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 STEP_DIR_NAME = "14_sort_qc_compile"
-MAX_PREVIEW_TRIANGLES = 256000
+MAX_PREVIEW_TRIANGLES = 500000
+MAX_STUDIOMDL_MODEL_VERTS = 65536
+SMD_SPLIT_RAW_VERTEX_BUDGET = 55000
+STUDIOMDL_FAILURE_EXCERPT_LINES = 60
 DEFAULT_DIRECTIONAL_JIGGLE_ANGLE = 25.0
 LEGACY_DIRECTIONAL_JIGGLE_ANGLE = 45.0
 COMPILED_EXTENSIONS = (".mdl", ".vvd", ".phy", ".dx80.vtx", ".dx90.vtx", ".sw.vtx")
@@ -102,12 +106,52 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def compact_command_output_excerpt(text: str, max_lines: int = STUDIOMDL_FAILURE_EXCERPT_LINES) -> str:
+    lines = [line.rstrip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    interesting = [
+        line
+        for line in lines
+        if any(token in line.upper() for token in ("ERROR", "WARNING", "FATAL", "ABORT", "FAILED", "TOO MANY", "MAXSTUDIOVERTS"))
+    ]
+    selected: list[str] = []
+    for line in interesting[-max_lines:]:
+        if line not in selected:
+            selected.append(line)
+    tail_budget = max(0, max_lines - len(selected))
+    for line in lines[-tail_budget:]:
+        if line not in selected:
+            selected.append(line)
+    if not selected:
+        selected = lines[-max_lines:]
+    return "\n".join(selected[-max_lines:])
+
+
 class StudioMDLCompileError(RuntimeError):
-    def __init__(self, qc_path: Path, log_path: Path, output: str) -> None:
+    def __init__(self, qc_path: Path, log_path: Path, output: str, exit_code: int | None = None) -> None:
         self.qc_path = qc_path
         self.log_path = log_path
         self.output = output
-        super().__init__(f"StudioMDL failed for {qc_path.name}; see {log_path}")
+        self.exit_code = exit_code
+        self.output_excerpt = compact_command_output_excerpt(output)
+        message = f"StudioMDL failed for {qc_path.name}"
+        if exit_code is not None:
+            message += f" with exit code {exit_code}"
+        message += f"; see {log_path}"
+        if self.output_excerpt:
+            message += "\n\nStudioMDL output excerpt:\n" + self.output_excerpt
+        super().__init__(message)
+
+    def to_report(self) -> dict[str, Any]:
+        return {
+            "type": self.__class__.__name__,
+            "message": str(self),
+            "exit_code": self.exit_code,
+            "qc_path": str(self.qc_path),
+            "log_path": str(self.log_path),
+            "output_excerpt": self.output_excerpt,
+        }
 
 
 def hidden_subprocess_kwargs() -> dict[str, object]:
@@ -720,6 +764,57 @@ def orientation_code(pos: tuple[float, float, float], landmarks: dict[str, tuple
     return (-10, 10, -10, 10)
 
 
+def default_jiggle_params(jiggle_type: str) -> dict[str, float]:
+    kind = str(jiggle_type or "Directional Jiggle")
+    if kind == "Spring Jiggle":
+        return {
+            "length": 15.0,
+            "tip_mass": 30.0,
+            "pitch_stiffness": 40.0,
+            "pitch_damping": 5.0,
+            "yaw_stiffness": 40.0,
+            "yaw_damping": 3.0,
+            "along_stiffness": 100.0,
+            "along_damping": 0.0,
+            "angle_constraint": 14.0,
+            "base_mass": 15.0,
+            "base_stiffness": 50.0,
+            "base_damping": 6.0,
+            "left_min": -0.15,
+            "left_max": 0.15,
+            "left_friction": 0.01,
+            "up_min": -0.15,
+            "up_max": 0.15,
+            "up_friction": 0.01,
+            "forward_min": -0.01,
+            "forward_max": 0.01,
+            "forward_friction": 0.05,
+        }
+    if kind == "Omni Jiggle":
+        return {
+            "length": 15.0,
+            "tip_mass": 0.0,
+            "pitch_stiffness": 10.0,
+            "pitch_damping": 2.0,
+            "yaw_stiffness": 10.0,
+            "yaw_damping": 2.0,
+            "along_stiffness": 100.0,
+            "along_damping": 0.0,
+            "angle_constraint": 30.0,
+        }
+    return {
+        "length": 10.0,
+        "tip_mass": 100.0,
+        "pitch_stiffness": 25.0,
+        "pitch_damping": 2.0,
+        "yaw_stiffness": 25.0,
+        "yaw_damping": 2.0,
+        "along_stiffness": 50.0,
+        "along_damping": 1.0,
+        "angle_constraint": 90.0,
+    }
+
+
 def classify_jigglebones(nodes: dict[int, SmdNode], stats: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     essentials = [(node.name, node.global_pos) for node in nodes.values() if is_essential_bone(node.name)]
     landmarks = {node.name: node.global_pos for node in nodes.values()}
@@ -816,6 +911,7 @@ def classify_jigglebones(nodes: dict[int, SmdNode], stats: dict[str, dict[str, A
                 "essential_ancestor": ancestor,
                 "pitch_constraint": [pitch_min, pitch_max],
                 "yaw_constraint": [yaw_min, yaw_max],
+                "jiggle_params": default_jiggle_params(jiggle_type),
                 "reason": reason,
                 "warnings": warnings,
             }
@@ -1107,6 +1203,7 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
     gmod = detect_gmod(gmod_root, studiomdl_path)
     if not gmod.get("studiomdl_path"):
         warnings.append("Garry's Mod StudioMDL was not detected; compile will require manual selection.")
+    physics_globals, physics_rows, physics_collision_text_lines = physics_plan_from_qc_lines(collision_qc_block({"inputs": discovered}))
 
     workspace_name = Path(discovered["workspace_root"]).name
     workspace_stem = re.sub(r"_[0-9a-f]{8,}$", "", workspace_name, flags=re.IGNORECASE)
@@ -1132,6 +1229,9 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
         "gmod": gmod,
         "inputs": discovered,
         "rows": jiggle_rows,
+        "physics_globals": physics_globals,
+        "physics_rows": physics_rows,
+        "physics_collision_text_lines": physics_collision_text_lines,
         "invert_jiggle_direction": False,
         "include_mci_metadata_json": True,
         "material_rows": material_plan_rows(texture_manifest),
@@ -1258,34 +1358,51 @@ def bodygroup_block(name: str, smd: str, optional_blank: bool = True) -> list[st
     return lines
 
 
-def bodygroup_qc_blocks(source_dir: Path) -> list[str]:
+def bodygroup_qc_blocks(source_dir: Path, include_flexes: bool = True) -> list[str]:
     lines: list[str] = []
     consumed = {"Physics.smd"}
     if (source_dir / "Face.smd").exists():
         consumed.add("Face.smd")
         face_vta = source_dir / "Face.vta"
-        lines.extend(flex_model_block("Face", "Face.smd", face_vta) if face_vta.exists() else bodygroup_block("Face", "Face.smd"))
+        lines.extend(
+            flex_model_block("Face", "Face.smd", face_vta)
+            if include_flexes and face_vta.exists()
+            else bodygroup_block("Face", "Face.smd")
+        )
     if (source_dir / "Body.smd").exists():
         consumed.add("Body.smd")
         body_vta = source_dir / "Body.vta"
-        lines.extend(flex_model_block("Body", "Body.smd", body_vta) if body_vta.exists() else bodygroup_block("Body", "Body.smd"))
+        lines.extend(
+            flex_model_block("Body", "Body.smd", body_vta)
+            if include_flexes and body_vta.exists()
+            else bodygroup_block("Body", "Body.smd")
+        )
     for smd in sorted(source_dir.glob("*.smd"), key=lambda item: natural_key(item.name)):
         if smd.name in consumed:
             continue
         name = smd.stem
         vta = source_dir / f"{name}.vta"
-        if vta.exists():
+        if include_flexes and vta.exists():
             lines.extend(flex_model_block(name, smd.name, vta))
             continue
         lines.extend(bodygroup_block(name, smd.name))
     return lines
 
 
-def base_qc_lines(plan: dict[str, Any], source_dir: Path, pm: bool = False, include_definebones: list[str] | None = None, include_jiggles: list[str] | None = None, include_hboxes: list[str] | None = None, include_collision: bool = False) -> list[str]:
+def base_qc_lines(
+    plan: dict[str, Any],
+    source_dir: Path,
+    pm: bool = False,
+    include_definebones: list[str] | None = None,
+    include_jiggles: list[str] | None = None,
+    include_hboxes: list[str] | None = None,
+    include_collision: bool = False,
+    include_flexes: bool = True,
+) -> list[str]:
     lines: list[str] = []
     lines.append('// Created by MMD Character Importer Step 14\n\n')
     lines.extend(qc_model_header(plan, pm=pm))
-    lines.extend(bodygroup_qc_blocks(source_dir))
+    lines.extend(bodygroup_qc_blocks(source_dir, include_flexes=include_flexes))
     lines.append('$surfaceprop "flesh" \n\n')
     lines.append('$contents "solid" \n\n')
     lines.append("$illumposition -0.637 0 35.954 \n\n")
@@ -1332,33 +1449,45 @@ def base_qc_lines(plan: dict[str, Any], source_dir: Path, pm: bool = False, incl
     return lines
 
 
-def spring_jiggle_block(name: str) -> list[str]:
+def jiggle_params_for_row(row: dict[str, Any], jiggle_type: str) -> dict[str, float]:
+    params = default_jiggle_params(jiggle_type)
+    raw_params = row.get("jiggle_params")
+    if isinstance(raw_params, dict):
+        for key, value in raw_params.items():
+            if key in params:
+                params[key] = qc_float(value, params[key])
+    return params
+
+
+def spring_jiggle_block(row: dict[str, Any]) -> list[str]:
+    name = str(row.get("bone") or "")
+    params = jiggle_params_for_row(row, "Spring Jiggle")
     return [
         f'$jigglebone "{name}"\n',
         "{\n",
         " is_flexible\n",
         " {\n",
-        "     length 15\n",
-        "     tip_mass 30\n",
-        "     pitch_stiffness 40\n",
-        "     pitch_damping 5\n",
-        "     yaw_stiffness 40\n",
-        "     yaw_damping 3\n",
-        "     along_stiffness 100\n",
-        "     along_damping 0\n",
-        "     angle_constraint 14\n",
+        f"     length {fmt_qc_float(params['length'], 15.0)}\n",
+        f"     tip_mass {fmt_qc_float(params['tip_mass'], 30.0)}\n",
+        f"     pitch_stiffness {fmt_qc_float(params['pitch_stiffness'], 40.0)}\n",
+        f"     pitch_damping {fmt_qc_float(params['pitch_damping'], 5.0)}\n",
+        f"     yaw_stiffness {fmt_qc_float(params['yaw_stiffness'], 40.0)}\n",
+        f"     yaw_damping {fmt_qc_float(params['yaw_damping'], 3.0)}\n",
+        f"     along_stiffness {fmt_qc_float(params['along_stiffness'], 100.0)}\n",
+        f"     along_damping {fmt_qc_float(params['along_damping'], 0.0)}\n",
+        f"     angle_constraint {fmt_qc_float(params['angle_constraint'], 14.0)}\n",
         " }\n",
         " has_base_spring\n",
         " {\n",
-        "     base_mass 15\n",
-        "     stiffness 50\n",
-        "     damping 6\n",
-        "     left_constraint -0.15 0.15\n",
-        "     left_friction 0.01\n",
-        "     up_constraint -0.15 0.15\n",
-        "     up_friction 0.01\n",
-        "     forward_constraint -0.01 0.01\n",
-        "     forward_friction 0.05\n",
+        f"     base_mass {fmt_qc_float(params['base_mass'], 15.0)}\n",
+        f"     stiffness {fmt_qc_float(params['base_stiffness'], 50.0)}\n",
+        f"     damping {fmt_qc_float(params['base_damping'], 6.0)}\n",
+        f"     left_constraint {fmt_qc_float(params['left_min'], -0.15)} {fmt_qc_float(params['left_max'], 0.15)}\n",
+        f"     left_friction {fmt_qc_float(params['left_friction'], 0.01)}\n",
+        f"     up_constraint {fmt_qc_float(params['up_min'], -0.15)} {fmt_qc_float(params['up_max'], 0.15)}\n",
+        f"     up_friction {fmt_qc_float(params['up_friction'], 0.01)}\n",
+        f"     forward_constraint {fmt_qc_float(params['forward_min'], -0.01)} {fmt_qc_float(params['forward_max'], 0.01)}\n",
+        f"     forward_friction {fmt_qc_float(params['forward_friction'], 0.05)}\n",
         " }\n",
         "}\n",
     ]
@@ -1397,25 +1526,31 @@ def normalized_constraint(values: object, fallback: tuple[float, float], invert:
     return normalized_constraint_pair(fallback)
 
 
-def omni_jiggle_block(name: str, invert_direction: bool = False) -> list[str]:
-    pitch = normalized_constraint([-25, 25], (-25.0, 25.0), invert_direction)
-    yaw = normalized_constraint([-10, 10], (-10.0, 10.0), invert_direction)
+def omni_jiggle_block(row: dict[str, Any], invert_direction: bool = False) -> list[str]:
+    name = str(row.get("bone") or "")
+    params = jiggle_params_for_row(row, "Omni Jiggle")
+    if bool(row.get("jiggle_constraint_overrides")):
+        pitch = normalized_constraint(row.get("pitch_constraint"), (-25.0, 25.0), invert_direction)
+        yaw = normalized_constraint(row.get("yaw_constraint"), (-10.0, 10.0), invert_direction)
+    else:
+        pitch = normalized_constraint([-25, 25], (-25.0, 25.0), invert_direction)
+        yaw = normalized_constraint([-10, 10], (-10.0, 10.0), invert_direction)
     return [
         f'$jigglebone "{name}"\n',
         "{\n",
         " is_flexible\n",
         " {\n",
-        "     length 15\n",
-        "     tip_mass 0\n",
+        f"     length {fmt_qc_float(params['length'], 15.0)}\n",
+        f"     tip_mass {fmt_qc_float(params['tip_mass'], 0.0)}\n",
         f"     pitch_constraint {pitch[0]:g} {pitch[1]:g}\n",
-        "     pitch_stiffness 10\n",
-        "     pitch_damping 2\n",
+        f"     pitch_stiffness {fmt_qc_float(params['pitch_stiffness'], 10.0)}\n",
+        f"     pitch_damping {fmt_qc_float(params['pitch_damping'], 2.0)}\n",
         f"     yaw_constraint {yaw[0]:g} {yaw[1]:g}\n",
-        "     yaw_stiffness 10\n",
-        "     yaw_damping 2\n",
-        "     along_stiffness 100\n",
-        "     along_damping 0\n",
-        "     angle_constraint 30\n",
+        f"     yaw_stiffness {fmt_qc_float(params['yaw_stiffness'], 10.0)}\n",
+        f"     yaw_damping {fmt_qc_float(params['yaw_damping'], 2.0)}\n",
+        f"     along_stiffness {fmt_qc_float(params['along_stiffness'], 100.0)}\n",
+        f"     along_damping {fmt_qc_float(params['along_damping'], 0.0)}\n",
+        f"     angle_constraint {fmt_qc_float(params['angle_constraint'], 30.0)}\n",
         " }\n",
         "}\n",
     ]
@@ -1423,6 +1558,7 @@ def omni_jiggle_block(name: str, invert_direction: bool = False) -> list[str]:
 
 def directional_jiggle_block(row: dict[str, Any], invert_direction: bool = False) -> list[str]:
     name = str(row.get("bone") or "")
+    params = jiggle_params_for_row(row, "Directional Jiggle")
     pitch = normalized_constraint(row.get("pitch_constraint"), (-10.0, 10.0), invert_direction)
     yaw = normalized_constraint(row.get("yaw_constraint"), (-10.0, 10.0), invert_direction)
     return [
@@ -1430,17 +1566,17 @@ def directional_jiggle_block(row: dict[str, Any], invert_direction: bool = False
         "{\n",
         " is_flexible\n",
         " {\n",
-        "     length 10\n",
-        "     tip_mass 100\n",
+        f"     length {fmt_qc_float(params['length'], 10.0)}\n",
+        f"     tip_mass {fmt_qc_float(params['tip_mass'], 100.0)}\n",
         f"     pitch_constraint {pitch[0]:g} {pitch[1]:g}\n",
-        "     pitch_stiffness 25\n",
-        "     pitch_damping 2\n",
+        f"     pitch_stiffness {fmt_qc_float(params['pitch_stiffness'], 25.0)}\n",
+        f"     pitch_damping {fmt_qc_float(params['pitch_damping'], 2.0)}\n",
         f"     yaw_constraint {yaw[0]:g} {yaw[1]:g}\n",
-        "     yaw_stiffness 25\n",
-        "     yaw_damping 2\n",
-        "     along_stiffness 50\n",
-        "     along_damping 1\n",
-        "     angle_constraint 90\n",
+        f"     yaw_stiffness {fmt_qc_float(params['yaw_stiffness'], 25.0)}\n",
+        f"     yaw_damping {fmt_qc_float(params['yaw_damping'], 2.0)}\n",
+        f"     along_stiffness {fmt_qc_float(params['along_stiffness'], 50.0)}\n",
+        f"     along_damping {fmt_qc_float(params['along_damping'], 1.0)}\n",
+        f"     angle_constraint {fmt_qc_float(params['angle_constraint'], 90.0)}\n",
         " }\n",
         "}\n",
     ]
@@ -1460,10 +1596,10 @@ def jiggle_qc_blocks(plan: dict[str, Any], excluded_bones: set[str] | None = Non
             continue
         jiggles.append(name)
         if jiggle_type == "Spring Jiggle":
-            lines.extend(spring_jiggle_block(name))
+            lines.extend(spring_jiggle_block(row))
         elif jiggle_type == "Omni Jiggle":
             ignore.append(name)
-            lines.extend(omni_jiggle_block(name, invert_direction))
+            lines.extend(omni_jiggle_block(row, invert_direction))
         else:
             lines.extend(directional_jiggle_block(row, invert_direction))
     return lines, jiggles, ignore
@@ -1609,11 +1745,165 @@ def normalize_qc_line_list(raw_lines: object) -> list[str]:
     return split_inline_qc_block_opening_braces(lines)
 
 
+def qc_float(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        if math.isfinite(number):
+            return number
+    except Exception:
+        pass
+    return float(default)
+
+
+def fmt_qc_float(value: object, default: float = 0.0) -> str:
+    number = qc_float(value, default)
+    if math.isclose(number, round(number), abs_tol=1e-6):
+        return str(int(round(number)))
+    text = f"{number:.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def default_physics_constraint() -> dict[str, float]:
+    return {"min": 0.0, "max": 0.0, "friction": 0.0}
+
+
+def physics_plan_from_qc_lines(lines: list[str]) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    globals_out: dict[str, Any] = {
+        "mass": 48.0,
+        "inertia": 12.0,
+        "damping": 0.8,
+        "rotdamping": 4.0,
+        "rootbone": "ValveBiped.Bip01_Pelvis",
+    }
+    rows_by_bone: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    collision_text_lines: list[str] = []
+    in_collision_text = False
+
+    def row_for_bone(bone: str) -> dict[str, Any]:
+        if bone not in rows_by_bone:
+            rows_by_bone[bone] = {
+                "bone": bone,
+                "enabled": True,
+                "constraints": {axis: default_physics_constraint() for axis in ("x", "y", "z")},
+            }
+            order.append(bone)
+        return rows_by_bone[bone]
+
+    for raw_line in lines:
+        line = str(raw_line)
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower == "$collisiontext":
+            in_collision_text = True
+        if in_collision_text:
+            collision_text_lines.append(line if line.endswith("\n") else line + "\n")
+            continue
+        match = re.match(r'^\$(mass|inertia|damping|rotdamping)\s+(-?\d+(?:\.\d+)?)', stripped, re.IGNORECASE)
+        if match:
+            globals_out[match.group(1).lower()] = qc_float(match.group(2))
+            continue
+        match = re.match(r'^\$rootbone\s+"([^"]+)"', stripped, re.IGNORECASE)
+        if match:
+            globals_out["rootbone"] = match.group(1)
+            continue
+        match = re.match(r'^\$jointmassbias\s+"([^"]+)"\s+(-?\d+(?:\.\d+)?)', stripped, re.IGNORECASE)
+        if match:
+            row = row_for_bone(match.group(1))
+            row["mass_bias"] = qc_float(match.group(2))
+            row["has_mass_bias"] = True
+            continue
+        match = re.match(r'^\$jointrotdamping\s+"([^"]+)"\s+(-?\d+(?:\.\d+)?)', stripped, re.IGNORECASE)
+        if match:
+            row = row_for_bone(match.group(1))
+            row["rot_damping"] = qc_float(match.group(2))
+            row["has_rot_damping"] = True
+            continue
+        match = re.match(
+            r'^\$jointconstrain\s+"([^"]+)"\s+([xyz])\s+limit\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)',
+            stripped,
+            re.IGNORECASE,
+        )
+        if match:
+            row = row_for_bone(match.group(1))
+            constraints = row.setdefault("constraints", {axis: default_physics_constraint() for axis in ("x", "y", "z")})
+            axis = match.group(2).lower()
+            if isinstance(constraints, dict):
+                constraints[axis] = {
+                    "min": qc_float(match.group(3)),
+                    "max": qc_float(match.group(4)),
+                    "friction": qc_float(match.group(5)),
+                }
+            continue
+    if not collision_text_lines:
+        standard_text_start = next((index for index, line in enumerate(STANDARD_PHYSICS_QC_LINES) if line.strip().lower() == "$collisiontext"), -1)
+        if standard_text_start >= 0:
+            collision_text_lines = list(STANDARD_PHYSICS_QC_LINES[standard_text_start:])
+    return globals_out, [rows_by_bone[bone] for bone in order], collision_text_lines
+
+
+def physics_constraint_for_axis(row: dict[str, Any], axis: str) -> dict[str, float]:
+    constraints = row.get("constraints")
+    if isinstance(constraints, dict):
+        value = constraints.get(axis)
+        if isinstance(value, dict):
+            return {
+                "min": qc_float(value.get("min")),
+                "max": qc_float(value.get("max")),
+                "friction": qc_float(value.get("friction")),
+            }
+    return default_physics_constraint()
+
+
+def build_physics_qc_lines(plan: dict[str, Any]) -> list[str]:
+    rows = [row for row in plan.get("physics_rows", []) if isinstance(row, dict) and row.get("enabled", True)]
+    globals_in = plan.get("physics_globals") if isinstance(plan.get("physics_globals"), dict) else {}
+    rootbone = str(globals_in.get("rootbone") or "ValveBiped.Bip01_Pelvis")
+    lines = [
+        '$collisionjoints "Physics.smd" \n',
+        "{\n",
+        f"\t$mass {fmt_qc_float(globals_in.get('mass'), 48.0)} \n",
+        f"\t$inertia {fmt_qc_float(globals_in.get('inertia'), 12.0)} \n",
+        f"\t$damping {fmt_qc_float(globals_in.get('damping'), 0.8)} \n",
+        f"\t$rotdamping {fmt_qc_float(globals_in.get('rotdamping'), 4.0)} \n",
+        f'\t$rootbone "{rootbone}" \n\n',
+    ]
+    for row in rows:
+        bone = str(row.get("bone") or "").strip()
+        if not bone:
+            continue
+        wrote_any = False
+        if bool(row.get("has_mass_bias")) or "mass_bias" in row:
+            lines.append(f'\t$jointmassbias "{bone}" {fmt_qc_float(row.get("mass_bias"), 0.0)} \n')
+            wrote_any = True
+        if bool(row.get("has_rot_damping")) or "rot_damping" in row:
+            lines.append(f'\t$jointrotdamping "{bone}" {fmt_qc_float(row.get("rot_damping"), 0.0)} \n')
+            wrote_any = True
+        for axis in ("x", "y", "z"):
+            constraint = physics_constraint_for_axis(row, axis)
+            lines.append(
+                f'\t$jointconstrain "{bone}" {axis} limit '
+                f'{fmt_qc_float(constraint["min"])} {fmt_qc_float(constraint["max"])} {fmt_qc_float(constraint["friction"])} \n'
+            )
+            wrote_any = True
+        if wrote_any:
+            lines.append("\n")
+    lines.append("}\n\n")
+    collision_text_lines = normalize_qc_line_list(plan.get("physics_collision_text_lines"))
+    if not collision_text_lines:
+        standard_text_start = next((index for index, line in enumerate(STANDARD_PHYSICS_QC_LINES) if line.strip().lower() == "$collisiontext"), -1)
+        collision_text_lines = list(STANDARD_PHYSICS_QC_LINES[standard_text_start:]) if standard_text_start >= 0 else []
+    lines.extend(collision_text_lines)
+    return lines
+
+
 def collision_qc_block(plan: dict[str, Any]) -> list[str]:
     # Step 8 still records whether the preview collision was produced from
     # concave-style pieces, but the compile QC intentionally omits
     # $concaveperjoint because StudioMDL collapses these thin Physics meshes
     # into a bad single convex hull when that option is present.
+    if isinstance(plan.get("physics_rows"), list) and plan.get("physics_rows"):
+        return build_physics_qc_lines(plan)
     inputs = plan.get("inputs", {}) if isinstance(plan.get("inputs"), dict) else {}
     physics_settings_value = str(inputs.get("step8_physics_settings") or "").strip()
     if physics_settings_value:
@@ -1772,6 +2062,59 @@ def make_definebone_from_smd_pose(bone: SmdBonePose, align_to_child: DefineBone 
         child_values = list(align_to_child.value_tokens) if len(align_to_child.value_tokens) >= 6 else [format_definebone_float(value) for value in align_to_child.values]
         values = values[:3] + child_values[3:12]
     return f'$definebone "{bone.name}" "{bone.parent}" ' + " ".join(values) + " \n"
+
+
+def order_smd_definebone_names(smd_poses: dict[str, SmdBonePose]) -> list[str]:
+    ordered: list[str] = []
+    visited: set[str] = set()
+    visiting: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            emit(f"WARNING: Cycle while ordering SMD definebones at {name!r}; keeping remaining order.")
+            return
+        bone = smd_poses.get(name)
+        if bone is None:
+            return
+        visiting.add(name)
+        if bone.parent and bone.parent in smd_poses:
+            visit(bone.parent)
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(name)
+
+    for name in sorted(smd_poses, key=natural_key):
+        visit(name)
+    return ordered
+
+
+def synthesize_definebones_from_smd(
+    source_dir: Path,
+    reason: str,
+    log_text: str = "",
+    pass_name: str = "smd_definebone_fallback",
+) -> tuple[list[str], dict[str, Any]]:
+    smd_poses = collect_smd_bone_poses(source_dir)
+    ordered = order_smd_definebone_names(smd_poses)
+    definebones = [make_definebone_from_smd_pose(smd_poses[name]) for name in ordered]
+    _missing, warning_lines = parse_missing_parent_warnings(log_text)
+    report: dict[str, Any] = {
+        "pass": pass_name,
+        "fallback": "smd_skeleton",
+        "reason": reason,
+        "warning_count": len(warning_lines),
+        "warning_lines": warning_lines,
+        "direct_missing_parents": {},
+        "inserted_bones": [],
+        "inserted_lines": [],
+        "source_smds": {name: smd_poses[name].source_smd for name in ordered if name in smd_poses},
+        "unrecoverable_missing_parents": [],
+        "synthesized_bone_count": len(definebones),
+        "synthesized_bones": ordered,
+    }
+    return definebones, report
 
 
 def expand_missing_definebones(initial_missing: set[str], defined: set[str], smd_poses: dict[str, SmdBonePose]) -> set[str]:
@@ -1964,6 +2307,28 @@ def validate_plan(plan: dict[str, Any]) -> list[str]:
     for bone in sorted(jiggles):
         if is_essential_bone(bone):
             errors.append(f"Essential bone cannot be jigglebone: {bone}")
+    for row in [entry for entry in plan.get("rows", []) if isinstance(entry, dict)]:
+        bone = str(row.get("bone") or "")
+        for key in ("pitch_constraint", "yaw_constraint"):
+            values = row.get(key)
+            if isinstance(values, list) and len(values) >= 2:
+                low = qc_float(values[0])
+                high = qc_float(values[1])
+                if low > high:
+                    errors.append(f"{bone} {key} minimum is greater than maximum.")
+    for row in [entry for entry in plan.get("physics_rows", []) if isinstance(entry, dict)]:
+        bone = str(row.get("bone") or "")
+        constraints = row.get("constraints")
+        if not isinstance(constraints, dict):
+            continue
+        for axis in ("x", "y", "z"):
+            value = constraints.get(axis)
+            if not isinstance(value, dict):
+                continue
+            low = qc_float(value.get("min"))
+            high = qc_float(value.get("max"))
+            if low > high:
+                errors.append(f"{bone} physics {axis.upper()} constraint minimum is greater than maximum.")
     return errors
 
 
@@ -2318,7 +2683,7 @@ def write_dynamic_model_importer_manifest(plan: dict[str, Any], addon_dir: Path,
 def compile_one(studiomdl: Path, game_dir: Path, qc_path: Path, log_path: Path) -> str:
     code, output = run_command([str(studiomdl), "-game", str(game_dir), "-nop4", "-verbose", str(qc_path)], log_path, cwd=qc_path.parent)
     if code != 0:
-        raise StudioMDLCompileError(qc_path, log_path, output)
+        raise StudioMDLCompileError(qc_path, log_path, output, code)
     return output
 
 
@@ -2341,6 +2706,202 @@ def is_collision_block_parser_failure(error: StudioMDLCompileError) -> bool:
             if any(candidate.startswith(command) for command in QC_BLOCK_COMMANDS_WITH_SEPARATE_OPEN_BRACE):
                 return True
     return False
+
+
+def source_has_vta_files(source_dir: Path) -> bool:
+    return any(source_dir.glob("*.vta"))
+
+
+def is_vta_model_compile_failure(error: StudioMDLCompileError, source_dir: Path) -> bool:
+    if not source_has_vta_files(source_dir):
+        return False
+    text = error.output or ""
+    if not text:
+        try:
+            text = error.log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            text = ""
+    upper = text.upper()
+    return "VTA MODEL" in upper
+
+
+def is_too_many_verts_compile_failure(error: StudioMDLCompileError) -> bool:
+    upper = (error.output or "").upper()
+    if "TOO MANY VERTS IN MODEL" in upper or "MAXSTUDIOVERTS" in upper:
+        return True
+    try:
+        log_text = error.log_path.read_text(encoding="utf-8", errors="replace").upper()
+    except Exception:
+        log_text = ""
+    return "TOO MANY VERTS IN MODEL" in log_text or "MAXSTUDIOVERTS" in log_text
+
+
+def find_studiomdl_compile_error(exc: BaseException) -> StudioMDLCompileError | None:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, StudioMDLCompileError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def failure_report_from_exception(plan: dict[str, Any], exc: BaseException, traceback_text: str) -> dict[str, Any]:
+    warnings = list(plan.get("warnings", [])) if isinstance(plan.get("warnings"), list) else []
+    compile_error = find_studiomdl_compile_error(exc)
+    failure: dict[str, Any] = {
+        "type": exc.__class__.__name__,
+        "message": str(exc),
+        "traceback": traceback_text,
+    }
+    if compile_error is not None:
+        failure["studiomdl"] = compile_error.to_report()
+    return {
+        "version": 1,
+        "kind": "sort_qc_compile_report",
+        "status": "failed",
+        "addon_dir": str(plan.get("addon_dir") or ""),
+        "source_dir": str(plan.get("source_dir") or ""),
+        "validation": {"ok": False, "errors": [str(exc)], "warnings": warnings},
+        "validation_errors": [str(exc)],
+        "warnings": warnings,
+        "failure": failure,
+        "studiomdl_failure": failure.get("studiomdl", {}),
+    }
+
+
+def write_failure_outputs(plan_path: Path, exc: BaseException) -> tuple[Path, Path]:
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except Exception:
+        plan = {}
+    qc_dir = Path(str(plan.get("qc_dir") or plan_path.parent))
+    qc_dir.mkdir(parents=True, exist_ok=True)
+    traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    (qc_dir / "qc_failure_traceback.log").write_text(traceback_text, encoding="utf-8")
+    report = failure_report_from_exception(plan, exc, traceback_text)
+    report_path = qc_dir / "qc_report.json"
+    files_path = qc_dir / "qc_files.json"
+    write_json(report_path, report)
+    files_payload = {
+        "addon_dir": str(plan.get("addon_dir") or ""),
+        "source_dir": str(plan.get("source_dir") or ""),
+        "files": [],
+        "validation": report["validation"],
+        "validation_errors": report["validation_errors"],
+        "warnings": report["warnings"],
+        "failure": report["failure"],
+        "studiomdl_failure": report["studiomdl_failure"],
+    }
+    write_json(files_path, files_payload)
+    return report_path, files_path
+
+
+def read_raw_smd_triangle_sections(path: Path) -> tuple[list[str], list[list[str]]]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "triangles":
+            continue
+        prefix = lines[: index + 1]
+        triangles: list[list[str]] = []
+        cursor = index + 1
+        while cursor < len(lines):
+            if lines[cursor].strip() == "end":
+                break
+            if cursor + 3 >= len(lines):
+                break
+            triangles.append(lines[cursor : cursor + 4])
+            cursor += 4
+        return prefix, triangles
+    return lines, []
+
+
+def write_raw_smd_triangle_chunk(path: Path, prefix: list[str], triangles: list[list[str]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for line in prefix:
+            handle.write(line.rstrip("\r\n") + "\n")
+        for triangle in triangles:
+            for line in triangle:
+                handle.write(line.rstrip("\r\n") + "\n")
+        handle.write("end\n")
+
+
+def split_smd_chunk_stems(stem: str, chunk_count: int, reserved: set[str]) -> list[str]:
+    stems = [stem]
+    reserved.add(stem.lower())
+    for index in range(2, chunk_count + 1):
+        base = f"{stem}_{index:02d}"
+        candidate = base
+        suffix = 2
+        while candidate.lower() in reserved:
+            candidate = f"{base}_part{suffix:02d}"
+            suffix += 1
+        reserved.add(candidate.lower())
+        stems.append(candidate)
+    return stems
+
+
+def split_oversized_smds_for_compile(source_dir: Path, vertex_budget: int = SMD_SPLIT_RAW_VERTEX_BUDGET) -> dict[str, Any]:
+    smds = [
+        path
+        for path in sorted(source_dir.glob("*.smd"), key=lambda item: natural_key(item.name))
+        if path.name.lower() != "physics.smd"
+    ]
+    reserved = {path.stem.lower() for path in smds}
+    backup_dir = source_dir / "_oversized_smd_originals"
+    report: dict[str, Any] = {
+        "version": 1,
+        "kind": "oversized_smd_split_report",
+        "raw_vertex_budget": vertex_budget,
+        "max_studiomdl_model_verts": MAX_STUDIOMDL_MODEL_VERTS,
+        "splits": [],
+    }
+    for smd in smds:
+        prefix, triangles = read_raw_smd_triangle_sections(smd)
+        raw_vertex_count = len(triangles) * 3
+        if not triangles or raw_vertex_count <= vertex_budget:
+            continue
+        chunks: list[list[list[str]]] = []
+        current: list[list[str]] = []
+        current_vertices = 0
+        for triangle in triangles:
+            if current and current_vertices + 3 > vertex_budget:
+                chunks.append(current)
+                current = []
+                current_vertices = 0
+            current.append(triangle)
+            current_vertices += 3
+        if current:
+            chunks.append(current)
+        if len(chunks) <= 1:
+            continue
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / smd.name
+        shutil.copyfile(smd, backup_path)
+        chunk_stems = split_smd_chunk_stems(smd.stem, len(chunks), reserved)
+        chunk_rows: list[dict[str, Any]] = []
+        for chunk_stem, chunk in zip(chunk_stems, chunks):
+            chunk_path = source_dir / f"{chunk_stem}.smd"
+            write_raw_smd_triangle_chunk(chunk_path, prefix, chunk)
+            chunk_rows.append(
+                {
+                    "name": chunk_path.name,
+                    "triangle_count": len(chunk),
+                    "raw_vertex_count": len(chunk) * 3,
+                }
+            )
+        report["splits"].append(
+            {
+                "source": smd.name,
+                "backup": str(backup_path),
+                "original_triangle_count": len(triangles),
+                "original_raw_vertex_count": raw_vertex_count,
+                "chunk_count": len(chunks),
+                "chunks": chunk_rows,
+            }
+        )
+    return report
 
 
 def fallback_gmod_compile_candidates(gmod: dict[str, Any]) -> list[dict[str, str]]:
@@ -2557,15 +3118,46 @@ def compose(plan_path: Path) -> dict[str, Any]:
     model = str(plan["model_name"])
 
     initial_qc = source_dir / "compile_initial.qc"
-    write_lines(initial_qc, base_qc_lines(plan, source_dir, pm=False))
+    write_lines(initial_qc, base_qc_lines(plan, source_dir, pm=False, include_flexes=False))
     define_log = qc_dir / "compile_definebones.log"
     emit("Running studiomdl -definebones.")
     code, define_output = run_command([str(studiomdl), "-game", str(game_dir), "-definebones", "-nop4", "-verbose", str(initial_qc)], define_log, cwd=source_dir)
-    if code != 0:
-        raise RuntimeError(f"StudioMDL -definebones failed; see {define_log}")
-    definebones = extract_definebones(define_output)
-    emit(f"Captured {len(definebones)} definebone lines.")
     definebone_repair_reports: list[dict[str, Any]] = []
+    if code != 0:
+        reason = f"StudioMDL -definebones failed with exit code {code}; see {define_log}"
+        emit("WARNING: " + reason)
+        definebones, fallback_report = synthesize_definebones_from_smd(source_dir, reason, define_output)
+        definebone_repair_reports.append(fallback_report)
+        if not definebones:
+            excerpt = compact_command_output_excerpt(define_output)
+            detail = f"{reason}; SMD skeleton fallback did not find any bones."
+            if excerpt:
+                detail += "\n\nStudioMDL output excerpt:\n" + excerpt
+            raise RuntimeError(detail)
+        warnings.append(
+            "StudioMDL -definebones failed, so Step 14 generated definebones from the exported SMD skeleton instead. "
+            f"See {define_log}"
+        )
+        emit(f"Generated {len(definebones)} definebone lines from exported SMD skeleton.")
+    else:
+        definebones = extract_definebones(define_output)
+        if not definebones:
+            reason = f"StudioMDL -definebones completed but produced no $definebone lines; see {define_log}"
+            emit("WARNING: " + reason)
+            definebones, fallback_report = synthesize_definebones_from_smd(source_dir, reason, define_output)
+            definebone_repair_reports.append(fallback_report)
+            if not definebones:
+                excerpt = compact_command_output_excerpt(define_output)
+                detail = f"{reason}; SMD skeleton fallback did not find any bones."
+                if excerpt:
+                    detail += "\n\nStudioMDL output excerpt:\n" + excerpt
+                raise RuntimeError(detail)
+            warnings.append(
+                "StudioMDL -definebones produced no definebone lines, so Step 14 generated definebones from the exported SMD skeleton instead. "
+                f"See {define_log}"
+            )
+            emit(f"Generated {len(definebones)} definebone lines from exported SMD skeleton.")
+    emit(f"Captured {len(definebones)} definebone lines.")
     definebones, repair_report = repair_definebones(definebones, source_dir, define_output, "initial_definebones")
     definebone_repair_reports.append(repair_report)
     definebone_support_bones = {str(name) for name in repair_report.get("support_bones_excluded_from_jiggle", []) if str(name)}
@@ -2592,7 +3184,17 @@ def compose(plan_path: Path) -> dict[str, Any]:
     refresh_jiggle_outputs()
 
     hbox_probe_qc = source_dir / "compile_hbox_probe.qc"
-    write_lines(hbox_probe_qc, base_qc_lines(plan, source_dir, pm=False, include_definebones=definebones, include_jiggles=jiggle_lines))
+    write_lines(
+        hbox_probe_qc,
+        base_qc_lines(
+            plan,
+            source_dir,
+            pm=False,
+            include_definebones=definebones,
+            include_jiggles=jiggle_lines,
+            include_flexes=False,
+        ),
+    )
     hbox_log = qc_dir / "compile_hbox.log"
     emit("Running studiomdl -h for hitbox capture.")
     _code, hbox_output = run_command([str(studiomdl), "-game", str(game_dir), "-nop4", "-verbose", "-h", str(hbox_probe_qc)], hbox_log, cwd=source_dir)
@@ -2601,10 +3203,36 @@ def compose(plan_path: Path) -> dict[str, Any]:
 
     main_qc = source_dir / "compile.qc"
     pm_qc = source_dir / "compile_pm.qc"
+    flex_compile_enabled = True
+    flex_compile_disabled_reason = ""
 
     def refresh_compile_qcs() -> Path | None:
-        write_lines(main_qc, base_qc_lines(plan, source_dir, pm=False, include_definebones=definebones, include_jiggles=jiggle_lines, include_hboxes=hboxes, include_collision=True))
-        write_lines(pm_qc, base_qc_lines(plan, source_dir, pm=True, include_definebones=definebones, include_jiggles=jiggle_lines, include_hboxes=hboxes, include_collision=True))
+        write_lines(
+            main_qc,
+            base_qc_lines(
+                plan,
+                source_dir,
+                pm=False,
+                include_definebones=definebones,
+                include_jiggles=jiggle_lines,
+                include_hboxes=hboxes,
+                include_collision=True,
+                include_flexes=flex_compile_enabled,
+            ),
+        )
+        write_lines(
+            pm_qc,
+            base_qc_lines(
+                plan,
+                source_dir,
+                pm=True,
+                include_definebones=definebones,
+                include_jiggles=jiggle_lines,
+                include_hboxes=hboxes,
+                include_collision=True,
+                include_flexes=flex_compile_enabled,
+            ),
+        )
         return build_carms_qc(plan, source_dir, definebones)
 
     carms_qc = refresh_compile_qcs()
@@ -2691,30 +3319,83 @@ def compose(plan_path: Path) -> dict[str, Any]:
 
     if not carms_qc:
         warnings.append("Step 10 c_arms output was not found; c_arms QC and Lua hands registration were skipped.")
-    clean_expected_compiled(compile_game_dir, author, category, stems)
-    try:
-        compile_all_models()
-    except StudioMDLCompileError as exc:
-        if not is_collision_block_parser_failure(exc):
-            raise
-        fallback_candidates = fallback_gmod_compile_candidates(gmod)
-        if not fallback_candidates:
-            raise RuntimeError(
-                "The selected StudioMDL rejected the physics collision block, and no standard Garry's Mod "
-                f"StudioMDL fallback was found. See {exc.log_path}"
-            ) from exc
-        fallback = fallback_candidates[0]
-        compile_studiomdl = Path(str(fallback["studiomdl_path"]))
-        compile_game_dir = Path(str(fallback["game_dir"]))
-        warning = (
-            "Selected StudioMDL rejected the physics collision block; retrying Step 14 compile with standard "
-            f"Garry's Mod StudioMDL: {compile_studiomdl}"
-        )
-        warnings.append(warning)
-        emit("WARNING: " + warning)
+    fallback_compile_used = False
+    oversized_smd_split_applied = False
+    oversized_smd_split_report: dict[str, Any] = {}
+    successful_compile_log_suffix = ""
+    while True:
+        suffix_parts: list[str] = []
+        if fallback_compile_used:
+            suffix_parts.append("fallback")
+        if not flex_compile_enabled:
+            suffix_parts.append("no_flex")
+        log_suffix = "_".join(suffix_parts)
         clean_expected_compiled(compile_game_dir, author, category, stems)
-        compile_all_models("fallback")
+        try:
+            compile_all_models(log_suffix)
+            successful_compile_log_suffix = log_suffix
+            break
+        except StudioMDLCompileError as exc:
+            if flex_compile_enabled and is_vta_model_compile_failure(exc, source_dir):
+                flex_compile_enabled = False
+                flex_compile_disabled_reason = f"StudioMDL failed while loading VTA flex data; see {exc.log_path}"
+                warning = (
+                    "StudioMDL failed while compiling VTA flex data, so Step 14 is retrying without flex controllers. "
+                    "The model will compile, but facial/body flex controls from VTA files will be unavailable. "
+                    f"See {exc.log_path}"
+                )
+                warnings.append(warning)
+                emit("WARNING: " + warning)
+                carms_qc = refresh_compile_qcs()
+                continue
+            if not flex_compile_enabled and not oversized_smd_split_applied and is_too_many_verts_compile_failure(exc):
+                split_report = split_oversized_smds_for_compile(source_dir)
+                split_rows = split_report.get("splits", [])
+                if split_rows:
+                    oversized_smd_split_applied = True
+                    oversized_smd_split_report = split_report
+                    write_json(qc_dir / "oversized_smd_split_report.json", split_report)
+                    split_summary = ", ".join(
+                        f"{row.get('source')} -> {row.get('chunk_count')} chunks"
+                        for row in split_rows
+                        if isinstance(row, dict)
+                    )
+                    warning = (
+                        "StudioMDL rejected an oversized SMD after flex fallback, so Step 14 split the oversized "
+                        f"mesh bodygroup(s) and retried: {split_summary}. Flex controllers remain disabled for this compile."
+                    )
+                    warnings.append(warning)
+                    emit("WARNING: " + warning)
+                    carms_qc = refresh_compile_qcs()
+                    continue
+            if not fallback_compile_used and is_collision_block_parser_failure(exc):
+                fallback_candidates = fallback_gmod_compile_candidates(gmod)
+                if not fallback_candidates:
+                    raise RuntimeError(
+                        "The selected StudioMDL rejected the physics collision block, and no standard Garry's Mod "
+                        f"StudioMDL fallback was found. See {exc.log_path}"
+                    ) from exc
+                fallback = fallback_candidates[0]
+                compile_studiomdl = Path(str(fallback["studiomdl_path"]))
+                compile_game_dir = Path(str(fallback["game_dir"]))
+                fallback_compile_used = True
+                warning = (
+                    "Selected StudioMDL rejected the physics collision block; retrying Step 14 compile with standard "
+                    f"Garry's Mod StudioMDL: {compile_studiomdl}"
+                )
+                warnings.append(warning)
+                emit("WARNING: " + warning)
+                continue
+            raise
     write_definebone_repair_report(qc_dir, definebone_repair_reports)
+    studiomdl_logs = {
+        "definebones": str(define_log),
+        "hitbox_probe": str(hbox_log),
+        "main": str(compile_log_path("compile_main", successful_compile_log_suffix)),
+        "player": str(compile_log_path("compile_pm", successful_compile_log_suffix)),
+    }
+    if carms_qc:
+        studiomdl_logs["c_arms"] = str(compile_log_path("compile_carms", successful_compile_log_suffix))
 
     emit("Composing final addon folder.")
     generated_files: list[dict[str, Any]] = []
@@ -2828,6 +3509,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "compile_source_copy_dir": str(compile_source_copy_dir),
         "distribution_compile_source_dir": str(distribution_compile_source_dir) if str(distribution_compile_source_dir) != "." else "",
         "include_mci_metadata_json": include_mci_metadata_json,
+        "studiomdl_logs": studiomdl_logs,
+        "flex_compile_enabled": flex_compile_enabled,
+        "flex_compile_disabled_reason": flex_compile_disabled_reason,
+        "oversized_smd_split_report": str(qc_dir / "oversized_smd_split_report.json") if oversized_smd_split_report else "",
         "gmod_addons_dir": str(gmod_addons_dir) if str(gmod_addons_dir) != "." else "",
         "gmod_addon_dir": str(gmod_addon_dir) if str(gmod_addon_dir) != "." else "",
         "files": generated_files,
@@ -2847,6 +3532,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "distribution_compile_source_dir": str(distribution_compile_source_dir) if str(distribution_compile_source_dir) != "." else "",
         "copy_to_gmod_addons": bool(plan.get("copy_to_gmod_addons", False)),
         "include_mci_metadata_json": include_mci_metadata_json,
+        "studiomdl_logs": studiomdl_logs,
+        "flex_compile_enabled": flex_compile_enabled,
+        "flex_compile_disabled_reason": flex_compile_disabled_reason,
+        "oversized_smd_split_report": str(qc_dir / "oversized_smd_split_report.json") if oversized_smd_split_report else "",
         "gmod_addons_dir": str(gmod_addons_dir) if str(gmod_addons_dir) != "." else "",
         "gmod_addon_dir": str(gmod_addon_dir) if str(gmod_addon_dir) != "." else "",
         "source_dir": str(source_dir),
@@ -2930,7 +3619,15 @@ def main() -> int:
         if Path(result["paths"]["plan"]) != args.plan_json:
             shutil.copyfile(result["paths"]["plan"], args.plan_json)
         return 0
-    result = compose(args.plan_json)
+    try:
+        result = compose(args.plan_json)
+    except Exception as exc:
+        report_path, files_path = write_failure_outputs(args.plan_json, exc)
+        if args.report_json and not same_resolved_path(report_path, args.report_json):
+            shutil.copyfile(report_path, args.report_json)
+        if args.files_json and not same_resolved_path(files_path, args.files_json):
+            shutil.copyfile(files_path, args.files_json)
+        raise
     if args.report_json:
         write_json(args.report_json, result["report"])
     if args.files_json:

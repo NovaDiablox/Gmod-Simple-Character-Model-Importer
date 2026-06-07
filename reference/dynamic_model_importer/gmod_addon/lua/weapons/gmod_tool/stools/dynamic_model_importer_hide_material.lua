@@ -289,22 +289,35 @@ if CLIENT then
         if selectedIndex >= #self.HudData.Mats then
             selectedIndex = #self.HudData.Mats - 1
         end
-        local x = ScrW() / 2 - 380
-        local y = ScrH() / 2 - 120
-        local width = 360
+        selectedIndex = math.max(0, selectedIndex)
         local rowHeight = 18
-        local rows = math.min(#self.HudData.Mats, 12)
-        draw.RoundedBox(4, x, y, width, rowHeight * (rows + 2) + 8, Color(0, 0, 0, 180))
+        local materialCount = #self.HudData.Mats
+        local maxRows = math.max(8, math.floor((ScrH() - 32) / rowHeight) - 2)
+        local rows = math.min(materialCount, maxRows)
+        local panelHeight = rowHeight * (rows + 2) + 8
+        local width = math.min(560, math.max(380, math.floor(ScrW() * 0.34)))
+        local x = math.max(12, math.floor(ScrW() / 2 - width - 180))
+        local y = math.Clamp(math.floor(ScrH() / 2 - panelHeight / 2), 12, math.max(12, ScrH() - panelHeight - 12))
+        local startIndex = math.Clamp(selectedIndex - math.floor(rows / 2), 0, math.max(0, materialCount - rows))
+        local endIndex = math.min(materialCount - 1, startIndex + rows - 1)
+        draw.RoundedBox(4, x, y, width, panelHeight, Color(0, 0, 0, 180))
         draw.SimpleText(L("Materials"), "ChatFont", x + 6, y + 5, color_white)
+        draw.SimpleText(string.format("%d-%d / %d", startIndex, endIndex, materialCount), "ChatFont", x + width - 8, y + 5, Color(210, 210, 210), TEXT_ALIGN_RIGHT)
         for i = 1, rows do
-            local index = i - 1
+            local index = startIndex + i - 1
             local rowY = y + 5 + rowHeight * i
             if index == selectedIndex then
                 draw.RoundedBox(0, x + 3, rowY - 1, width - 6, rowHeight, Color(0, 150, 255, 110))
             end
-            local materialPath = tostring(self.HudData.CurMats[i] or "")
+            local materialPath = tostring(self.HudData.CurMats[index + 1] or "")
             local color = self.HudData.OvrMats[index] and Color(255, 120, 120) or color_white
-            draw.SimpleText(index .. ": " .. materialPath, "ChatFont", x + 6, rowY, color)
+            draw_clipped_text(index .. ": " .. materialPath, "ChatFont", x + 6, rowY, color, width - 12)
+        end
+        if startIndex > 0 then
+            draw.SimpleText("...", "ChatFont", x + width - 28, y + rowHeight + 3, Color(210, 210, 210), TEXT_ALIGN_RIGHT)
+        end
+        if endIndex < materialCount - 1 then
+            draw.SimpleText("...", "ChatFont", x + width - 28, y + 5 + rowHeight * rows, Color(210, 210, 210), TEXT_ALIGN_RIGHT)
         end
 
         local originalPath = tostring(self.HudData.Mats[selectedIndex + 1] or "")

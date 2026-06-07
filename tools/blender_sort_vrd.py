@@ -17,7 +17,7 @@ from mathutils import Matrix, Quaternion, Vector
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_PREVIEW_TRIANGLES = 256000
+MAX_PREVIEW_TRIANGLES = 500000
 HELPER_MESH_NAMES = {"smd_bone_vis"}
 EXCLUDED_INFERENCE_OBJECTS = {"physics"}
 VRD_FRAMES = [0, 10, 20, 30]
@@ -796,7 +796,7 @@ def create_standard_vrd_action(armature: bpy.types.Object, prefer_addon: bool) -
         for pose_bone in armature.pose.bones:
             pose_bone.keyframe_insert(data_path="location", frame=frame)
             pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-    return False, "L4D2 auto_pose unavailable; manual VRD action fallback was used."
+    return False, ""
 
 
 def key_all_bones_at_vrd_frames(armature: bpy.types.Object) -> None:

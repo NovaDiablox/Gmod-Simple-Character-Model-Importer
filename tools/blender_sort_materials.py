@@ -593,7 +593,7 @@ def collect_material_entries() -> tuple[list[dict[str, object]], dict[str, objec
     return entries, summary
 
 
-def collect_material_preview(entries: list[dict[str, object]], max_triangles: int = 256000) -> dict[str, object]:
+def collect_material_preview(entries: list[dict[str, object]], max_triangles: int = 500000) -> dict[str, object]:
     uid_by_slot = material_slots_by_uid(entries)
     total_triangles = 0
     for obj in mesh_objects():

@@ -18,7 +18,7 @@ from mathutils import Vector
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WEIGHT_THRESHOLD = 0.12
-MAX_PREVIEW_TRIANGLES = 256000
+MAX_PREVIEW_TRIANGLES = 500000
 HELPER_MESH_NAMES = {"smd_bone_vis"}
 EXCLUDED_IMPORT_NAMES = {"physics.smd"}
 FOREARM_ROOTS = {"ValveBiped.Bip01_R_Forearm", "ValveBiped.Bip01_L_Forearm"}

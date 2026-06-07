@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import colorsys
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -22,6 +24,9 @@ DEFAULT_SCALE_FACTOR = 40.457
 DEFAULT_SOURCE_VERTEX_LIMIT = 65535
 RTX_REMIX_VERTEX_LIMIT = 32767
 SOURCE_VERTEX_LIMIT = DEFAULT_SOURCE_VERTEX_LIMIT
+UNUSED_SHAPEKEY_DELTA_EPSILON = 1e-1
+FACE_MERGE_NECK_BONE = "ValveBiped.Bip01_Neck1"
+FACE_MERGE_NECK_Z_TOLERANCE = 1e-4
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 TRACKING_PREFIXES = ("mci_mat_", "mci_final_")
 HELPER_MESH_NAMES = {"smd_bone_vis"}
@@ -289,6 +294,18 @@ def active_armature() -> bpy.types.Object | None:
     return arms[0]
 
 
+def armature_bone_head_world_z(armature: bpy.types.Object | None, bone_name: str) -> float | None:
+    if armature is None or getattr(armature, "data", None) is None:
+        return None
+    bone = armature.data.bones.get(bone_name)
+    if bone is None:
+        return None
+    try:
+        return float((armature.matrix_world @ bone.head_local).z)
+    except Exception:
+        return None
+
+
 def associated_meshes(armature: bpy.types.Object | None = None) -> list[bpy.types.Object]:
     meshes = mesh_objects()
     if armature is None:
@@ -505,98 +522,211 @@ def select_meshes(meshes: list[bpy.types.Object]) -> None:
         bpy.context.view_layer.objects.active = meshes[0]
 
 
+@contextlib.contextmanager
+def suppress_blender_output(enabled: bool):
+    if not enabled:
+        yield
+        return
+    null_fd = None
+    saved_fds: list[tuple[int, int]] = []
+    try:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        for fd in (1, 2):
+            try:
+                saved_fds.append((fd, os.dup(fd)))
+                os.dup2(null_fd, fd)
+            except Exception:
+                pass
+    except Exception:
+        saved_fds = []
+        null_fd = None
+    try:
+        yield
+    finally:
+        for fd, saved_fd in reversed(saved_fds):
+            try:
+                os.dup2(saved_fd, fd)
+            except Exception:
+                pass
+            try:
+                os.close(saved_fd)
+            except Exception:
+                pass
+        if null_fd is not None:
+            try:
+                os.close(null_fd)
+            except Exception:
+                pass
+
+
 def separate_by_materials() -> dict[str, object]:
     ensure_object_mode()
     meshes = mesh_objects()
     before = sorted(obj.name for obj in meshes)
-    report = {"method": "", "before_count": len(before), "after_count": len(before), "warnings": []}
+    report = {
+        "method": "blender_mesh_separate_material",
+        "before_count": len(before),
+        "after_count": len(before),
+        "warnings": [],
+        "notes": ["Using Blender native material separation for deterministic background processing."],
+        "suppressed_bmesh_shape_key_warning_objects": [],
+    }
     if not meshes:
         report["warnings"].append("No mesh objects found for bodygroup separation.")
         return report
-    try:
-        select_meshes(meshes)
-        result = bpy.ops.cats_manual.separate_by_materials()
-        if "FINISHED" in result:
-            report["method"] = "cats_manual.separate_by_materials"
-            report["after_count"] = len(mesh_objects())
-            return report
-    except Exception as exc:
-        report["warnings"].append(f"CATS material separation failed; using Blender fallback: {exc}")
-    report["method"] = "blender_mesh_separate_material"
     for obj in list(mesh_objects()):
         if len(obj.data.materials) <= 1 or len(obj.data.polygons) <= 0:
             continue
+        has_shape_keys = obj.data.shape_keys is not None and len(obj.data.shape_keys.key_blocks) > 1
+        if has_shape_keys:
+            report["suppressed_bmesh_shape_key_warning_objects"].append(obj.name)
         ensure_object_mode()
         bpy.ops.object.select_all(action="DESELECT")
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="SELECT")
-        try:
-            bpy.ops.mesh.separate(type="MATERIAL")
-        finally:
-            bpy.ops.object.mode_set(mode="OBJECT")
+        with suppress_blender_output(has_shape_keys):
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="SELECT")
+            try:
+                bpy.ops.mesh.separate(type="MATERIAL")
+            finally:
+                bpy.ops.object.mode_set(mode="OBJECT")
     report["after_count"] = len(mesh_objects())
+    suppressed_count = len(report["suppressed_bmesh_shape_key_warning_objects"])
+    if suppressed_count:
+        report["notes"].append(
+            f"Suppressed Blender bmesh shape-key conversion warnings during {suppressed_count} material separation operation(s)."
+        )
     return report
 
 
-def fallback_prune_shapekeys(obj: bpy.types.Object, epsilon: float = 1e-7) -> dict[str, object]:
+def shapekey_relative_key(obj: bpy.types.Object, key: bpy.types.ShapeKey) -> bpy.types.ShapeKey | None:
+    keys = obj.data.shape_keys
+    if keys is None:
+        return None
+    relative = getattr(key, "relative_key", None)
+    if relative is not None:
+        return relative
+    return keys.key_blocks.get("Basis") or (keys.key_blocks[0] if keys.key_blocks else None)
+
+
+def shapekey_max_delta(obj: bpy.types.Object, key: bpy.types.ShapeKey, epsilon: float = UNUSED_SHAPEKEY_DELTA_EPSILON) -> float:
+    relative = shapekey_relative_key(obj, key)
+    if relative is None:
+        return 0.0
+    max_delta = 0.0
+    for index, item in enumerate(key.data):
+        if index >= len(relative.data):
+            break
+        delta = (item.co - relative.data[index].co).length
+        if delta > max_delta:
+            max_delta = float(delta)
+        if max_delta > epsilon:
+            break
+    return max_delta
+
+
+def fallback_prune_shapekeys(obj: bpy.types.Object, epsilon: float = UNUSED_SHAPEKEY_DELTA_EPSILON) -> dict[str, object]:
     keys = obj.data.shape_keys
     if keys is None or len(keys.key_blocks) <= 1:
-        return {"removed": [], "method": "fallback", "warnings": []}
-    basis = keys.key_blocks[0]
+        return {"removed": [], "method": "fallback", "warnings": [], "epsilon": epsilon, "movement_threshold_meters": epsilon}
     removed: list[str] = []
+    kept: list[dict[str, object]] = []
     warnings: list[str] = []
     for key in list(keys.key_blocks)[1:]:
         try:
-            max_delta = 0.0
-            for index, item in enumerate(key.data):
-                delta = (item.co - basis.data[index].co).length
-                if delta > max_delta:
-                    max_delta = float(delta)
-                if max_delta > epsilon:
-                    break
+            max_delta = shapekey_max_delta(obj, key, epsilon)
             if max_delta <= epsilon:
                 removed.append(key.name)
                 obj.shape_key_remove(key)
+            else:
+                kept.append({"name": key.name, "max_delta": round(float(max_delta), 8)})
         except Exception as exc:
             warnings.append(f"{obj.name}:{key.name}: {exc}")
-    return {"removed": removed, "method": "fallback", "warnings": warnings}
+    return {
+        "removed": removed,
+        "kept": kept,
+        "method": "fallback",
+        "warnings": warnings,
+        "epsilon": epsilon,
+        "movement_threshold_meters": epsilon,
+    }
 
 
-def prune_shapekeys() -> dict[str, object]:
-    report = {"objects": [], "warnings": []}
+def prune_shapekeys(use_cats: bool = False, stage: str = "") -> dict[str, object]:
+    report = {
+        "objects": [],
+        "warnings": [],
+        "method": "per_bodygroup_unused_delta_prune",
+        "movement_threshold_meters": UNUSED_SHAPEKEY_DELTA_EPSILON,
+    }
+    if stage:
+        report["stage"] = stage
     for obj in mesh_objects():
-        object_report: dict[str, object] = {"object": obj.name, "method": "", "removed": [], "warnings": []}
+        object_report: dict[str, object] = {
+            "object": obj.name,
+            "method": "",
+            "removed": [],
+            "warnings": [],
+            "movement_threshold_meters": UNUSED_SHAPEKEY_DELTA_EPSILON,
+        }
         if obj.data.shape_keys is None or len(obj.data.shape_keys.key_blocks) <= 1:
             object_report["method"] = "none"
             report["objects"].append(object_report)
             continue
-        try:
-            ensure_object_mode()
-            bpy.ops.object.select_all(action="DESELECT")
-            obj.select_set(True)
-            bpy.context.view_layer.objects.active = obj
-            result = bpy.ops.cats_shapekey.shape_key_prune()
-            object_report["method"] = "cats_shapekey.shape_key_prune"
-            object_report["result"] = list(result)
-        except Exception as exc:
-            object_report["method"] = "cats_shapekey.shape_key_prune_failed"
-            object_report["warnings"] = list(object_report.get("warnings", [])) + [f"CATS shapekey prune unavailable: {exc}"]
+        if use_cats:
+            try:
+                ensure_object_mode()
+                bpy.ops.object.select_all(action="DESELECT")
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                result = bpy.ops.cats_shapekey.shape_key_prune()
+                object_report["method"] = "cats_shapekey.shape_key_prune"
+                object_report["result"] = list(result)
+            except Exception as exc:
+                object_report["method"] = "cats_shapekey.shape_key_prune_failed"
+                object_report["warnings"] = list(object_report.get("warnings", [])) + [f"CATS shapekey prune unavailable: {exc}"]
+        else:
+            object_report["method"] = "fallback_unused_delta_prune"
         fallback = fallback_prune_shapekeys(obj)
         fallback_removed = list(fallback.get("removed", [])) if isinstance(fallback.get("removed"), list) else []
         fallback_warnings = list(fallback.get("warnings", [])) if isinstance(fallback.get("warnings"), list) else []
+        fallback_kept = list(fallback.get("kept", [])) if isinstance(fallback.get("kept"), list) else []
         existing_removed = list(object_report.get("removed", [])) if isinstance(object_report.get("removed"), list) else []
         object_report["removed"] = existing_removed + [name for name in fallback_removed if name not in existing_removed]
         object_report["fallback_removed"] = fallback_removed
+        object_report["fallback_kept"] = fallback_kept
         object_report["fallback_method"] = fallback.get("method", "fallback")
-        if object_report.get("method") == "cats_shapekey.shape_key_prune":
+        object_report["unused_delta_epsilon"] = fallback.get("epsilon", UNUSED_SHAPEKEY_DELTA_EPSILON)
+        object_report["movement_threshold_meters"] = fallback.get("movement_threshold_meters", UNUSED_SHAPEKEY_DELTA_EPSILON)
+        if use_cats and object_report.get("method") == "cats_shapekey.shape_key_prune":
             object_report["method"] = "cats_shapekey.shape_key_prune+fallback_unused_delta_prune"
-        elif object_report.get("method") == "cats_shapekey.shape_key_prune_failed":
+        elif use_cats and object_report.get("method") == "cats_shapekey.shape_key_prune_failed":
             object_report["method"] = "fallback_unused_delta_prune"
         object_report["warnings"] = list(object_report.get("warnings", [])) + fallback_warnings
         report["objects"].append(object_report)
     return report
+
+
+def combined_shapekey_prune_report(pre_report: dict[str, object], post_report: dict[str, object]) -> dict[str, object]:
+    warnings: list[str] = []
+    for report in (pre_report, post_report):
+        values = report.get("warnings", []) if isinstance(report, dict) else []
+        if isinstance(values, list):
+            warnings.extend(str(value) for value in values if value)
+    return {
+        "method": "pre_and_post_material_separation",
+        "movement_threshold_meters": UNUSED_SHAPEKEY_DELTA_EPSILON,
+        "pre_separation": pre_report,
+        "post_separation": post_report,
+        "objects": post_report.get("objects", []) if isinstance(post_report.get("objects"), list) else [],
+        "warnings": warnings,
+    }
 
 
 def material_texture_path(mat: bpy.types.Material | None) -> str:
@@ -769,6 +899,11 @@ def shape_key_names(obj: bpy.types.Object) -> list[str]:
         base = blender_base_name(str(key.name or "")).strip()
         if not base or base.lower() == "basis":
             continue
+        try:
+            if shapekey_max_delta(obj, key, UNUSED_SHAPEKEY_DELTA_EPSILON) <= UNUSED_SHAPEKEY_DELTA_EPSILON:
+                continue
+        except Exception:
+            pass
         names.append(str(key.name))
     return names
 
@@ -952,6 +1087,7 @@ def source_uid(index: int, obj: bpy.types.Object) -> str:
 def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dict[str, object]]:
     sources: list[dict[str, object]] = []
     used_names: set[str] = set()
+    neck_base_z = armature_bone_head_world_z(active_armature(), FACE_MERGE_NECK_BONE)
     for index, obj in enumerate(sorted(mesh_objects(), key=lambda item: natural_key(item.name)), start=1):
         if len(obj.data.vertices) <= 0 or len(obj.data.polygons) <= 0:
             continue
@@ -984,6 +1120,17 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
             source_maxs = [max(component_bounds(component)[1][axis] for component in components) for axis in range(3)]
         else:
             source_mins, source_maxs = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        face_merge_neck_filter_passed = True
+        if facial_merge_candidate and neck_base_z is not None and source_mins[2] < neck_base_z - FACE_MERGE_NECK_Z_TOLERANCE:
+            face_merge_neck_filter_passed = False
+            facial_merge_candidate = False
+            facial_merge_reasons.append(
+                f"excluded from Face merge because vertices extend below {FACE_MERGE_NECK_BONE} base"
+            )
+            warnings.append(
+                f"Not merged into Face because at least one vertex is below {FACE_MERGE_NECK_BONE} base Z "
+                f"({source_mins[2]:.6f} < {neck_base_z:.6f})."
+            )
         if zero_alpha_materials:
             warnings.append(
                 "Disabled by default because material alpha is 0: "
@@ -1036,6 +1183,8 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
                 "facial_shapekey_names": facial_names,
                 "facial_merge_candidate": facial_merge_candidate,
                 "facial_merge_text_hint": facial_text_hint,
+                "facial_merge_neck_filter_passed": face_merge_neck_filter_passed,
+                "facial_merge_neck_base_z": round(float(neck_base_z), 6) if neck_base_z is not None else None,
                 "facial_merge_reasons": facial_merge_reasons,
                 "base_color_path": texture_path if not texture_path.startswith("packed:") else "",
                 "base_color_file": Path(texture_path).name if texture_path and not texture_path.startswith("packed:") else texture_path,
@@ -1046,7 +1195,7 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
     return sources
 
 
-def collect_bodygroup_preview(sources: list[dict[str, object]], max_triangles: int = 256000) -> dict[str, object]:
+def collect_bodygroup_preview(sources: list[dict[str, object]], max_triangles: int = 500000) -> dict[str, object]:
     uid_by_object: dict[str, str] = {}
     entry_by_uid: dict[str, dict[str, object]] = {}
     for entry in sources:
@@ -1204,6 +1353,10 @@ def build_bodygroups(sources: list[dict[str, object]]) -> list[dict[str, object]
                         "object_names": list(source.get("object_names", [])),
                         "material_names": list(source.get("material_names", [])),
                         "facial_shapekey_names": list(source.get("facial_shapekey_names", [])),
+                        "bounds_min": list(source.get("bounds_min", [])),
+                        "bounds_max": list(source.get("bounds_max", [])),
+                        "facial_merge_neck_filter_passed": bool(source.get("facial_merge_neck_filter_passed", True)),
+                        "facial_merge_neck_base_z": source.get("facial_merge_neck_base_z"),
                         "reasons": list(source.get("facial_merge_reasons", [])),
                     }
                     for source in face_sources
@@ -1249,6 +1402,8 @@ def build_bodygroups(sources: list[dict[str, object]]) -> list[dict[str, object]
                 "shapekey_names": list(source.get("shapekey_names", [])),
                 "facial_shapekey_names": list(source.get("facial_shapekey_names", [])),
                 "facial_merge_candidate": bool(source.get("facial_merge_candidate", False)),
+                "facial_merge_neck_filter_passed": bool(source.get("facial_merge_neck_filter_passed", True)),
+                "facial_merge_neck_base_z": source.get("facial_merge_neck_base_z"),
                 "warnings": sorted({str(warning) for warning in source.get("warnings", []) if warning}, key=natural_key),
             }
         )
@@ -1265,6 +1420,20 @@ def build_facial_merge_report(
         for source in sources
         if source.get("default_enabled", True) and source.get("facial_merge_candidate", False)
     ]
+    neck_filtered_sources = [
+        {
+            "uid": source.get("uid", ""),
+            "object_names": list(source.get("object_names", [])),
+            "material_names": list(source.get("material_names", [])),
+            "vertex_count": int(source.get("vertex_count", 0) or 0),
+            "bounds_min": list(source.get("bounds_min", [])),
+            "neck_base_z": source.get("facial_merge_neck_base_z"),
+            "facial_shapekey_names": list(source.get("facial_shapekey_names", [])),
+            "reasons": list(source.get("facial_merge_reasons", [])),
+        }
+        for source in sources
+        if source.get("default_enabled", True) and source.get("facial_merge_neck_filter_passed") is False
+    ]
     merged_group = next(
         (
             group
@@ -1276,6 +1445,11 @@ def build_facial_merge_report(
     warnings: list[str] = []
     if not candidates:
         warnings.append("No face-related material-separated sources were detected for merging.")
+    if neck_filtered_sources:
+        warnings.append(
+            f"Excluded {len(neck_filtered_sources)} facial-looking source(s) from Face merge because they extend below "
+            f"{FACE_MERGE_NECK_BONE} base."
+        )
     protected_over_limit = [
         {
             "uid": source.get("uid", ""),
@@ -1312,6 +1486,9 @@ def build_facial_merge_report(
         "target_bodygroup": merged_group.get("proposed_name", "Face") if candidates else "",
         "merged_vertex_count": merged_vertex_count,
         "merged_over_vertex_limit": bool(merged_vertex_count > vertex_limit),
+        "neck_filter_bone": FACE_MERGE_NECK_BONE,
+        "neck_filtered_source_count": len(neck_filtered_sources),
+        "neck_filtered_sources": neck_filtered_sources,
         "source_uids": [str(source.get("uid") or "") for source in candidates],
         "source_objects": [
             str(object_name)
@@ -2127,8 +2304,10 @@ def analyze_scene(
 ) -> tuple[dict[str, object], dict[str, object]]:
     vertex_limit = max(1, int(vertex_limit or DEFAULT_SOURCE_VERTEX_LIMIT))
     scale_report = maybe_scale_character(scale_factor, scale_preset=scale_preset, scale_reference_smd=scale_reference_smd)
+    pre_separation_shapekey_report = prune_shapekeys(stage="auto_pre_material_separation")
     separate_report = separate_by_materials()
-    shapekey_report = prune_shapekeys()
+    post_separation_shapekey_report = prune_shapekeys(stage="auto_post_material_separation")
+    shapekey_report = combined_shapekey_prune_report(pre_separation_shapekey_report, post_separation_shapekey_report)
     sources = collect_sources(vertex_limit)
     metrics = scene_metrics()
     preview = collect_bodygroup_preview(sources)
@@ -2236,6 +2415,15 @@ def remove_empty_meshes() -> None:
     for obj in list(mesh_objects()):
         if len(obj.data.vertices) == 0 or len(obj.data.polygons) == 0:
             bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def remove_zero_vertex_bodygroups() -> list[str]:
+    removed: list[str] = []
+    for obj in list(mesh_objects()):
+        if len(obj.data.vertices) == 0:
+            removed.append(obj.name)
+            bpy.data.objects.remove(obj, do_unlink=True)
+    return sorted(removed, key=natural_key)
 
 
 def split_object_by_vertex_group(obj: bpy.types.Object, group_name: str, new_name: str) -> list[bpy.types.Object]:
@@ -2634,6 +2822,10 @@ def apply_plan(
     for obj in list(mesh_objects()):
         if obj not in used_objects:
             bpy.data.objects.remove(obj, do_unlink=True)
+    removed_zero_vertex_bodygroups = remove_zero_vertex_bodygroups()
+    if removed_zero_vertex_bodygroups:
+        removed_names = set(removed_zero_vertex_bodygroups)
+        output_groups = [group for group in output_groups if str(group.get("name") or "") not in removed_names]
     output_blend.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(output_blend))
     validation_errors: list[str] = []
@@ -2684,6 +2876,7 @@ def apply_plan(
         "vertex_limit": vertex_limit,
         "advanced_clustering": analysis.get("advanced_clustering", {}),
         "split_report": split_report,
+        "removed_zero_vertex_bodygroups": removed_zero_vertex_bodygroups,
         "bodygroups": output_groups,
         "bodygroup_count": len(output_groups),
         "warnings": warnings,
@@ -2712,7 +2905,8 @@ def validate_manual_bodygroups(
     for obj in helper_meshes:
         warnings.append(f"{obj.name}: ignored Source/VTA helper mesh; not treated as a bodygroup.")
         bpy.data.objects.remove(obj, do_unlink=True)
-    shapekey_report = prune_shapekeys()
+    removed_zero_vertex_bodygroups = remove_zero_vertex_bodygroups()
+    shapekey_report = prune_shapekeys(stage="manual_bodygroup_validation")
     meshes = sorted([obj for obj in mesh_objects() if not is_helper_mesh_object(obj)], key=lambda obj: natural_key(obj.name))
     if not meshes:
         errors.append("No mesh bodygroups.")
@@ -2804,6 +2998,7 @@ def validate_manual_bodygroups(
         "output_blend": str(output_blend),
         "shapekey_prune": shapekey_report,
         "ignored_helper_meshes": ignored_helper_meshes,
+        "removed_zero_vertex_bodygroups": removed_zero_vertex_bodygroups,
         "missing_canonical_bodygroups": missing_canonical_names,
         "bodygroups": output_groups,
         "bodygroup_count": len(output_groups),
@@ -2827,7 +3022,8 @@ def main() -> int:
     args = parse_args()
     started = time.monotonic()
     vertex_limit = max(1, int(args.vertex_limit or DEFAULT_SOURCE_VERTEX_LIMIT))
-    bpy.ops.wm.open_mainfile(filepath=str(args.input_blend))
+    with suppress_blender_output(True):
+        bpy.ops.wm.open_mainfile(filepath=str(args.input_blend))
     if args.mode == "analyze":
         if not args.analysis_json or not args.plan_json:
             raise RuntimeError("--analysis-json and --plan-json are required in analyze mode")
@@ -2842,8 +3038,11 @@ def main() -> int:
         )
         analysis["elapsed_seconds"] = round(time.monotonic() - started, 3)
         if args.manual_edit_blend:
+            removed_zero_vertex_bodygroups = remove_zero_vertex_bodygroups()
             args.manual_edit_blend.parent.mkdir(parents=True, exist_ok=True)
+            analysis["removed_zero_vertex_bodygroups"] = removed_zero_vertex_bodygroups
             analysis["manual_edit_blend"] = str(args.manual_edit_blend)
+            plan["removed_zero_vertex_bodygroups"] = removed_zero_vertex_bodygroups
             plan["manual_edit_blend"] = str(args.manual_edit_blend)
             bpy.ops.wm.save_as_mainfile(filepath=str(args.manual_edit_blend))
             print(f"Wrote manual bodygroup edit blend: {args.manual_edit_blend}")

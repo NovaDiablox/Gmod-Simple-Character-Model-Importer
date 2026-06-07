@@ -27,7 +27,7 @@ from mathutils import Vector
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_]+")
 ROOT = Path(__file__).resolve().parents[1]
 COACD_ADDON_ZIP = ROOT / "plugins_software" / "coacd_blender_addon_1_0_45.zip"
-MAX_PREVIEW_TRIANGLES = 256000
+MAX_PREVIEW_TRIANGLES = 500000
 EPSILON = 1e-7
 MIN_MULTI_HULL_POINTS = 36
 MAX_HULL_SAMPLE_POINTS = 34
@@ -2143,8 +2143,6 @@ def make_coacd_region_geometry(
     source_weight_count = float(stats.get("weighted_vertex_count", 0.0) or 0.0)
     coverage_score = min(1.0, float(region.get("selected_vertex_count", 0) or 0) / max(1.0, source_weight_count))
     child_faces = int(region.get("child_face_count", 0) or 0)
-    if child_faces:
-        warnings.append(f"Included {child_faces} child-bone joint faces so this bone exports as one filled collision region.")
     metrics = {
         "coverage_score": round(float(coverage_score), 4),
         "piece_success_score": 1.0,
@@ -2436,8 +2434,6 @@ def make_connected_loft_geometry(
         return [], [], [], {"coverage_score": 0.0, "child_source_count": child_added}, ["Primitive fallback used because connected loft volume was invalid."]
 
     coverage_score = len(filtered) / max(1, len(source_points))
-    if child_added:
-        warnings.append(f"Included {child_added} child-bone joint samples to fill the connected collision span.")
     if coverage_score < 0.55:
         warnings.append("Very low silhouette coverage after outlier filtering.")
     if len(faces) > HIGH_TRIANGLE_WARNING:
@@ -2738,6 +2734,17 @@ def build_collision_parts(
     return parts, errors, timing
 
 
+def is_informational_collision_message(text: object) -> bool:
+    message = str(text or "").strip()
+    return (
+        message.startswith("Included ")
+        and (
+            message.endswith(" child-bone joint faces so this bone exports as one filled collision region.")
+            or message.endswith(" child-bone joint samples to fill the connected collision span.")
+        )
+    )
+
+
 def analyze_scene(input_blend: Path) -> tuple[dict[str, object], dict[str, object]]:
     analyze_started = time.monotonic()
     phase_timing: dict[str, object] = {"quality_preset": ACTIVE_COACD_QUALITY, "quality_label": current_quality_label()}
@@ -2768,7 +2775,11 @@ def analyze_scene(input_blend: Path) -> tuple[dict[str, object], dict[str, objec
     phase_timing["build_collision"] = build_timing
     warnings: list[str] = []
     for part in parts:
-        warnings.extend(str(warning) for warning in part.get("warnings", []) if warning)
+        warnings.extend(
+            str(warning)
+            for warning in part.get("warnings", [])
+            if warning and not is_informational_collision_message(warning)
+        )
     collision_started = time.monotonic()
     collision = collision_preview(parts, armature) if armature is not None else {"triangles": [], "triangle_count": 0}
     phase_timing["collision_preview_seconds"] = timing_entry(collision_started)
@@ -2859,7 +2870,11 @@ def validate_plan(
                     continue
                 if float(hull.get("volume", 0.0) or 0.0) <= EPSILON or int(hull.get("face_count", 0) or 0) <= 0:
                     errors.append(f"Collision part for {bone_name} has an invalid hull piece.")
-        warnings.extend(str(warning) for warning in part.get("warnings", []) if warning)
+        warnings.extend(
+            str(warning)
+            for warning in part.get("warnings", [])
+            if warning and not is_informational_collision_message(warning)
+        )
     return {"ok": not errors, "errors": errors, "warnings": sorted(set(warnings))}
 
 

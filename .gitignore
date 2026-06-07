@@ -20,3 +20,4 @@ MMDCharacterImporter.spec
 /reference/\!runtime_any_model_importer
 /reference
 /smoke_tests
+GmodSimpleMMDCharacterImporter.spec

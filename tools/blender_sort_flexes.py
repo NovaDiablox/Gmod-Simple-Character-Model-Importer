@@ -484,7 +484,7 @@ def flex_uid_lookup(flexes: list[dict[str, object]]) -> dict[tuple[str, str], st
     }
 
 
-def collect_flex_preview(flexes: list[dict[str, object]], max_triangles: int = 256000) -> dict[str, object]:
+def collect_flex_preview(flexes: list[dict[str, object]], max_triangles: int = 500000) -> dict[str, object]:
     lookup = flex_uid_lookup(flexes)
     total_triangles = sum(max(0, len(poly.vertices) - 2) for obj in mesh_objects() for poly in obj.data.polygons)
     stride = max(1, math.ceil(total_triangles / max_triangles)) if total_triangles else 1
