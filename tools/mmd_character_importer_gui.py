@@ -9568,10 +9568,44 @@ class ImporterWindow(QtWidgets.QMainWindow):
         except Exception:
             return any(str(warning or "").startswith("Koikatsu-style bone names detected:") for warning in analysis.warnings)
 
+    def analysis_has_parenting_warning(self, analysis: core.PmxAnalysis | None) -> bool:
+        if analysis is None:
+            return False
+        entries = getattr(analysis, "parenting_warning_bones", None)
+        return bool(isinstance(entries, list) and entries)
+
+    def parenting_warning_lines(self, analysis: core.PmxAnalysis) -> list[str]:
+        entries = getattr(analysis, "parenting_warning_bones", []) if analysis else []
+        if not isinstance(entries, list):
+            entries = []
+        lines = [
+            self._t(
+                "preflight.parenting_problem_bones",
+                "Bones that may have parenting problems:",
+            )
+        ]
+        for entry in entries[:24]:
+            if not isinstance(entry, dict):
+                continue
+            child = str(entry.get("child_name") or "")
+            parent = str(entry.get("parent_name") or "")
+            reason = str(entry.get("reason") or "")
+            ratio = entry.get("distance_ratio")
+            detail = reason.replace("_", " ")
+            try:
+                detail += f", distance {float(ratio):.2f}x model height"
+            except Exception:
+                pass
+            lines.append(f"- {child} -> {parent} ({detail})")
+        if len(entries) > 24:
+            lines.append(f"- ... {len(entries) - 24} more")
+        return lines
+
     def show_special_preflight_warning_dialog(self, analysis: core.PmxAnalysis) -> None:
         skeleton_failed = self.analysis_has_required_skeleton_failure(analysis)
         koikatsu_warning = self.analysis_has_koikatsu_bone_warning(analysis)
-        if not skeleton_failed and not koikatsu_warning:
+        parenting_warning = self.analysis_has_parenting_warning(analysis)
+        if not skeleton_failed and not koikatsu_warning and not parenting_warning:
             return
 
         dialog = QtWidgets.QMessageBox(self)
@@ -9595,7 +9629,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 for warning in analysis.warnings
                 if not str(warning or "").startswith("MMD skeleton compatibility check failed:")
             ]
-        else:
+        elif koikatsu_warning:
             dialog.setWindowTitle(self._t("preflight.title_koikatsu", "Koikatsu model compatibility warning"))
             dialog.setText(
                 self._t(
@@ -9620,6 +9654,27 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 for warning in analysis.warnings
                 if not str(warning or "").startswith("Koikatsu-style bone names detected:")
             ]
+        else:
+            dialog.setWindowTitle(self._t("preflight.title_parenting_failed", "Bone parenting warning"))
+            dialog.setText(
+                self._t(
+                    "preflight.parenting_expected_issue",
+                    "Some bones appear to be parented far away or to the opposite side, which may produce unexpected results in game.",
+                )
+            )
+            lines = self.parenting_warning_lines(analysis)
+            lines.append("")
+            lines.append(
+                self._t(
+                    "preflight.parenting_fix_advice",
+                    "Contact the model author or fix the parenting in Blender before using this tool. You can safely ignore this warning if you think this is a false positive.",
+                )
+            )
+            other_warnings = [
+                self.translate_preflight_warning(warning)
+                for warning in analysis.warnings
+                if not str(warning or "").startswith("Potential bone parenting issues detected:")
+            ]
 
         if other_warnings:
             lines.append("")
@@ -9642,12 +9697,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
         content_triggered = isinstance(scan, dict) and bool(scan.get("triggered"))
         skeleton_failed = self.analysis_has_required_skeleton_failure(analysis)
         koikatsu_warning = self.analysis_has_koikatsu_bone_warning(analysis)
+        parenting_warning = self.analysis_has_parenting_warning(analysis)
         if content_triggered:
             dialog.setWindowTitle(self._t("preflight.title_nsfw", "Potential NSFW model content"))
         elif skeleton_failed:
             dialog.setWindowTitle(self._t("preflight.title_skeleton_failed", "MMD skeleton compatibility warning"))
         elif koikatsu_warning:
             dialog.setWindowTitle(self._t("preflight.title_koikatsu", "Koikatsu model compatibility warning"))
+        elif parenting_warning:
+            dialog.setWindowTitle(self._t("preflight.title_parenting_failed", "Bone parenting warning"))
         else:
             dialog.setWindowTitle(title)
         if content_triggered:
@@ -9760,12 +9818,37 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 lines.append(self._t("preflight.other_warnings", "Other preflight warnings:"))
                 lines.extend(f"- {warning}" for warning in other_warnings)
             dialog.setInformativeText("\n".join(lines))
+        elif parenting_warning:
+            dialog.setText(
+                self._t(
+                    "preflight.parenting_expected_issue",
+                    "Some bones appear to be parented far away or to the opposite side, which may produce unexpected results in game.",
+                )
+            )
+            lines = self.parenting_warning_lines(analysis)
+            lines.append("")
+            lines.append(
+                self._t(
+                    "preflight.parenting_fix_advice",
+                    "Contact the model author or fix the parenting in Blender before using this tool. You can safely ignore this warning if you think this is a false positive.",
+                )
+            )
+            other_warnings = [
+                self.translate_preflight_warning(warning)
+                for warning in analysis.warnings
+                if not str(warning or "").startswith("Potential bone parenting issues detected:")
+            ]
+            if other_warnings:
+                lines.append("")
+                lines.append(self._t("preflight.other_warnings", "Other preflight warnings:"))
+                lines.extend(f"- {warning}" for warning in other_warnings)
+            dialog.setInformativeText("\n".join(lines))
         else:
             dialog.setText(generic_text)
             dialog.setInformativeText("\n".join(self.translate_preflight_warning(warning) for warning in analysis.warnings))
         proceed = dialog.addButton(
             self._t("preflight.proceed_anyway", "Proceed Anyway")
-            if content_triggered or skeleton_failed or koikatsu_warning
+            if content_triggered or skeleton_failed or koikatsu_warning or parenting_warning
             else self._t("common.proceed", "Proceed"),
             QtWidgets.QMessageBox.ButtonRole.AcceptRole,
         )
@@ -9845,6 +9928,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 "preflight.warning_koikatsu_bones",
                 "Koikatsu-style bone names detected: {count} bones contain cf_ or k_f_. Your model looks like it is from Koikatsu, and the import is likely to fail if your model is not simplified to Very Simple level in KKBP Blender plugin. You can ignore this warning only if you are sure that your model is optimized for MikuMikuDance.",
                 count=match.group(1),
+            )
+        match = re.fullmatch(
+            r"Potential bone parenting issues detected: ([\d,]+) bone\(s\) may be parented far away or to the opposite side: (.+)\. This may produce unexpected results in game\. Contact the model author or fix the parenting in Blender before using this tool\. You can safely ignore this warning if you think this is a false positive\.",
+            text,
+        )
+        if match:
+            return self._t(
+                "preflight.warning_parenting_bones",
+                "Potential bone parenting issues detected: {count} bone(s) may be parented far away or to the opposite side: {bones}. This may produce unexpected results in game. Contact the model author or fix the parenting in Blender before using this tool. You can safely ignore this warning if you think this is a false positive.",
+                count=match.group(1),
+                bones=match.group(2),
             )
         match = re.fullmatch(
             r"Potential NSFW shapekey names detected: ([\d,]+) keyword matches across ([\d,]+) morphs\. Auto porting is not optimized for this kind of model\.",

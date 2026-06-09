@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import hashlib
 import html.parser
 import json
+import math
 import os
 import re
 import shutil
@@ -196,6 +197,7 @@ class PmxAnalysis:
     missing_texture_refs: list[str] = field(default_factory=list)
     missing_skeleton_groups: list[str] = field(default_factory=list)
     missing_required_skeleton_bones: list[str] = field(default_factory=list)
+    parenting_warning_bones: list[dict[str, object]] = field(default_factory=list)
     content_warning_scan: dict[str, object] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -694,6 +696,9 @@ class PmxReader:
 
     def read_f32(self) -> float:
         return struct.unpack("<f", self.read_exact(4))[0]
+
+    def read_vector3(self) -> tuple[float, float, float]:
+        return (self.read_f32(), self.read_f32(), self.read_f32())
 
     def read_vector_bytes(self, count: int) -> None:
         self.read_exact(4 * count)
@@ -1697,8 +1702,8 @@ def ensure_portable_blender(progress: ProgressCallback | None = None) -> SetupRe
     return SetupResult(blender_exe=blender, version=version, reused=False, state_path=setup_state_path())
 
 
-def skip_vertex(reader: PmxReader, bone_index_size: int, additional_uvs: int) -> None:
-    reader.read_vector_bytes(3)
+def skip_vertex(reader: PmxReader, bone_index_size: int, additional_uvs: int) -> tuple[float, float, float]:
+    position = reader.read_vector3()
     reader.read_vector_bytes(3)
     reader.read_vector_bytes(2)
     for _ in range(additional_uvs):
@@ -1724,6 +1729,7 @@ def skip_vertex(reader: PmxReader, bone_index_size: int, additional_uvs: int) ->
     else:
         raise ValueError(f"unsupported PMX vertex weight type: {weight_type}")
     reader.read_f32()
+    return position
 
 
 def skip_material(reader: PmxReader, encoding: str, texture_index_size: int) -> None:
@@ -1748,11 +1754,11 @@ def skip_material(reader: PmxReader, encoding: str, texture_index_size: int) -> 
     reader.read_i32()
 
 
-def read_bone_names(reader: PmxReader, encoding: str, bone_index_size: int) -> tuple[str, str]:
+def read_bone_info(reader: PmxReader, encoding: str, bone_index_size: int) -> dict[str, object]:
     name = reader.read_string(encoding)
     english_name = reader.read_string(encoding)
-    reader.read_vector_bytes(3)
-    reader.read_index(bone_index_size)
+    position = reader.read_vector3()
+    parent_index = reader.read_index(bone_index_size)
     reader.read_i32()
     flags = reader.read_i16()
     if flags & 0x0001:
@@ -1780,7 +1786,12 @@ def read_bone_names(reader: PmxReader, encoding: str, bone_index_size: int) -> t
             if limited:
                 reader.read_vector_bytes(3)
                 reader.read_vector_bytes(3)
-    return name, english_name
+    return {
+        "name": name,
+        "english_name": english_name,
+        "position": position,
+        "parent_index": parent_index,
+    }
 
 
 def skip_morph(
@@ -1834,6 +1845,131 @@ def skip_morph(
         else:
             raise ValueError(f"unsupported PMX morph type: {morph_type}")
     return name, english_name
+
+
+def distance3(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return math.sqrt(sum((float(a[index]) - float(b[index])) ** 2 for index in range(3)))
+
+
+def percentile(sorted_values: list[float], fraction: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = int(max(0, min(len(sorted_values) - 1, round((len(sorted_values) - 1) * float(fraction)))))
+    return float(sorted_values[index])
+
+
+def pmx_bone_display_name(bone: dict[str, object]) -> str:
+    name = str(bone.get("name") or "").strip()
+    english = str(bone.get("english_name") or "").strip()
+    return name or english or f"bone_{int(bone.get('index', 0) or 0)}"
+
+
+def combined_bone_name_text(bone: dict[str, object]) -> str:
+    return f"{bone.get('name') or ''} {bone.get('english_name') or ''}".strip()
+
+
+def explicit_bone_side(name: str) -> str:
+    lowered = str(name or "").lower()
+    left = bool(re.search(r"(^|[_\-. ])l($|[_\-. ]|\d)|left|左", lowered))
+    right = bool(re.search(r"(^|[_\-. ])r($|[_\-. ]|\d)|right|右", lowered))
+    if left and not right:
+        return "L"
+    if right and not left:
+        return "R"
+    return ""
+
+
+def is_control_or_root_bone_name(name: str) -> bool:
+    lowered = str(name or "").lower()
+    compact = re.sub(r"[\s_.\-]+", "", lowered)
+    if not compact:
+        return True
+    control_tokens = (
+        "ik",
+        "target",
+        "dummy",
+        "root",
+        "mother",
+        "center",
+        "groove",
+        "全ての親",
+        "センター",
+        "グルーブ",
+        "操作",
+        "表示",
+    )
+    if any(token in lowered for token in control_tokens):
+        return True
+    return "先" in lowered and ("ik" in lowered or "センター" in lowered or "center" in lowered)
+
+
+def detect_parenting_warning_bones(
+    bones: list[dict[str, object]],
+    model_height: float,
+) -> list[dict[str, object]]:
+    if not bones or model_height <= 1.0e-6:
+        return []
+    distances: list[float] = []
+    pairs: list[tuple[dict[str, object], dict[str, object], float]] = []
+    for bone in bones:
+        try:
+            parent_index = int(bone.get("parent_index", -1) or -1)
+        except Exception:
+            parent_index = -1
+        if parent_index < 0 or parent_index >= len(bones):
+            continue
+        parent = bones[parent_index]
+        child_pos = bone.get("position")
+        parent_pos = parent.get("position")
+        if not isinstance(child_pos, tuple) or not isinstance(parent_pos, tuple):
+            continue
+        dist = distance3(child_pos, parent_pos)
+        distances.append(dist)
+        pairs.append((bone, parent, dist))
+    if not pairs:
+        return []
+    p95 = percentile(sorted(distances), 0.95)
+    extreme_threshold = max(float(model_height) * 0.9, p95 * 5.0)
+    side_threshold = float(model_height) * 0.15
+    warnings: list[dict[str, object]] = []
+    seen_children: set[int] = set()
+    for child, parent, dist in sorted(pairs, key=lambda item: item[2], reverse=True):
+        child_index = int(child.get("index", -1) or -1)
+        if child_index in seen_children:
+            continue
+        child_text = combined_bone_name_text(child)
+        if is_control_or_root_bone_name(child_text):
+            continue
+        parent_text = combined_bone_name_text(parent)
+        child_side = explicit_bone_side(child_text)
+        parent_side = explicit_bone_side(parent_text)
+        reason = ""
+        threshold = 0.0
+        if dist > extreme_threshold:
+            reason = "extreme_distance"
+            threshold = extreme_threshold
+        elif child_side and parent_side and child_side != parent_side and dist > side_threshold:
+            reason = "opposite_side_parent"
+            threshold = side_threshold
+        if not reason:
+            continue
+        seen_children.add(child_index)
+        warnings.append(
+            {
+                "child_index": child_index,
+                "child_name": pmx_bone_display_name(child),
+                "parent_index": int(parent.get("index", -1) or -1),
+                "parent_name": pmx_bone_display_name(parent),
+                "distance": round(float(dist), 6),
+                "model_height": round(float(model_height), 6),
+                "distance_ratio": round(float(dist) / max(float(model_height), 1.0e-9), 6),
+                "threshold": round(float(threshold), 6),
+                "reason": reason,
+                "child_side": child_side,
+                "parent_side": parent_side,
+            }
+        )
+    return warnings
 
 
 def load_warning_keywords(path: Path = WARNING_KEYWORDS_PATH) -> list[str]:
@@ -1939,8 +2075,19 @@ def analyze_pmx(pmx_path: Path, source_dir: Path | None = None) -> PmxAnalysis:
                 f"PMX vertex count {analysis.vertex_count:,} exceeds the supported limit of "
                 f"{MAX_SUPPORTED_PMX_VERTEX_COUNT:,}. This model is too large for the importer."
             )
+        vertex_bounds_min = [float("inf"), float("inf"), float("inf")]
+        vertex_bounds_max = [float("-inf"), float("-inf"), float("-inf")]
         for _ in range(analysis.vertex_count):
-            skip_vertex(reader, bone_index_size, additional_uvs)
+            position = skip_vertex(reader, bone_index_size, additional_uvs)
+            for axis in range(3):
+                value = float(position[axis])
+                vertex_bounds_min[axis] = min(vertex_bounds_min[axis], value)
+                vertex_bounds_max[axis] = max(vertex_bounds_max[axis], value)
+        model_height = (
+            vertex_bounds_max[2] - vertex_bounds_min[2]
+            if analysis.vertex_count > 0 and all(math.isfinite(value) for value in (vertex_bounds_min[2], vertex_bounds_max[2]))
+            else 0.0
+        )
 
         face_index_count = reader.read_i32()
         analysis.face_count = face_index_count // 3
@@ -1957,8 +2104,13 @@ def analyze_pmx(pmx_path: Path, source_dir: Path | None = None) -> PmxAnalysis:
         bone_names: set[str] = set()
         exact_bone_names: set[str] = set()
         koikatsu_bone_hint_count = 0
-        for _ in range(analysis.bone_count):
-            name, english_name = read_bone_names(reader, analysis.encoding, bone_index_size)
+        bone_infos: list[dict[str, object]] = []
+        for bone_index in range(analysis.bone_count):
+            bone_info = read_bone_info(reader, analysis.encoding, bone_index_size)
+            bone_info["index"] = bone_index
+            bone_infos.append(bone_info)
+            name = str(bone_info.get("name") or "")
+            english_name = str(bone_info.get("english_name") or "")
             stripped_name = name.strip()
             stripped_english_name = english_name.strip()
             lower_bone_names = [value.lower() for value in (stripped_name, stripped_english_name) if value]
@@ -1971,6 +2123,7 @@ def analyze_pmx(pmx_path: Path, source_dir: Path | None = None) -> PmxAnalysis:
                 exact_bone_names.add(stripped_english_name)
                 bone_names.add(stripped_english_name.lower())
         analysis.koikatsu_bone_hint_count = koikatsu_bone_hint_count
+        analysis.parenting_warning_bones = detect_parenting_warning_bones(bone_infos, model_height)
 
         analysis.morph_count = reader.read_i32()
         for _ in range(analysis.morph_count):
@@ -2046,6 +2199,19 @@ def analyze_pmx(pmx_path: Path, source_dir: Path | None = None) -> PmxAnalysis:
             "Your model looks like it is from Koikatsu, and the import is likely to fail if your model is not "
             "simplified to Very Simple level in KKBP Blender plugin. You can ignore this warning only if you are "
             "sure that your model is optimized for MikuMikuDance."
+        )
+    if analysis.parenting_warning_bones:
+        preview_pairs = [
+            f"{entry.get('child_name')} -> {entry.get('parent_name')}"
+            for entry in analysis.parenting_warning_bones[:8]
+        ]
+        preview = "; ".join(preview_pairs)
+        if len(analysis.parenting_warning_bones) > 8:
+            preview += f"; and {len(analysis.parenting_warning_bones) - 8} more"
+        warnings.append(
+            f"Potential bone parenting issues detected: {len(analysis.parenting_warning_bones):,} bone(s) may be parented far away or to the opposite side: {preview}. "
+            "This may produce unexpected results in game. Contact the model author or fix the parenting in Blender before using this tool. "
+            "You can safely ignore this warning if you think this is a false positive."
         )
     if analysis.morph_count > 96:
         warnings.append(f"High morph/shapekey count: {analysis.morph_count:,}; later flex work may be slow.")
