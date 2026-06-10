@@ -777,7 +777,7 @@ if CLIENT then
         end
 
         skirtButton.DoClick = function()
-            set_filter("", "ValveBiped.Bip01_Pelvis, ValveBiped.Bip01_Spine, ValveBiped.Bip01_Spine1, pelvis, spine, spine1", false)
+            set_filter("", "skirt, skirt_, skirtbone, skirtfront, skirtback, skirtleft, skirtright, 裙, スカート, 치마", true)
             set_filter_status()
         end
 
