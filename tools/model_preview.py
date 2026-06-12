@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Static PMX OpenGL preview for the MMD Character Importer."""
+"""Static PMX/VRM OpenGL preview for the MMD Character Importer."""
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import colorsys
+import hashlib
 import io
+import json
 import math
 import os
+import struct
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 import numpy as np
 
@@ -283,6 +289,14 @@ def _read_bone(reader: core.PmxReader, encoding: str, bone_index_size: int) -> P
 
 
 def load_static_preview_model(model_path: Path) -> StaticPreviewModel:
+    """Load a static preview model, dispatching on the file suffix (.pmx/.vrm)."""
+    model_path = model_path.resolve()
+    if model_path.suffix.lower() == ".vrm":
+        return _load_vrm_preview_model(model_path)
+    return _load_pmx_preview_model(model_path)
+
+
+def _load_pmx_preview_model(model_path: Path) -> StaticPreviewModel:
     model_path = model_path.resolve()
     warnings: list[str] = []
     # Read the whole file once: bulk sections (vertices, indices) are parsed with
@@ -362,6 +376,454 @@ def load_static_preview_model(model_path: Path) -> StaticPreviewModel:
         bones=bones,
         morph_count=morph_count,
         texture_count=len(texture_names),
+        warnings=warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# VRM (glTF 2.0 GLB container) preview loader
+# ---------------------------------------------------------------------------
+
+_GLTF_COMPONENT_DTYPES = {
+    5120: np.dtype("<i1"),
+    5121: np.dtype("<u1"),
+    5122: np.dtype("<i2"),
+    5123: np.dtype("<u2"),
+    5125: np.dtype("<u4"),
+    5126: np.dtype("<f4"),
+}
+_GLTF_TYPE_COMPONENTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
+_GLTF_NORMALIZED_SCALE = {5120: 127.0, 5121: 255.0, 5122: 32767.0, 5123: 65535.0}
+_GLTF_IMAGE_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/bmp": ".bmp",
+    "image/webp": ".webp",
+}
+
+
+def _parse_glb(data: bytes) -> tuple[dict, bytes]:
+    """Split a GLB container into its parsed JSON chunk and binary chunk."""
+    if len(data) < 12 or data[:4] != b"glTF":
+        raise ValueError(f"not a VRM/GLB file: invalid signature {data[:4]!r}")
+    _version, total_length = struct.unpack_from("<II", data, 4)
+    end = min(len(data), total_length) if total_length else len(data)
+    json_chunk: bytes | None = None
+    bin_chunk = b""
+    offset = 12
+    while offset + 8 <= end:
+        chunk_length, chunk_type = struct.unpack_from("<I4s", data, offset)
+        offset += 8
+        chunk = data[offset : offset + chunk_length]
+        if len(chunk) < chunk_length:
+            raise EOFError("unexpected end of VRM/GLB while reading chunks")
+        if chunk_type == b"JSON" and json_chunk is None:
+            json_chunk = chunk
+        elif chunk_type == b"BIN\x00" and not bin_chunk:
+            bin_chunk = chunk
+        offset += chunk_length
+    if json_chunk is None:
+        raise ValueError("VRM/GLB file has no JSON chunk")
+    return json.loads(json_chunk.decode("utf-8")), bin_chunk
+
+
+def _read_gltf_accessor(gltf: dict, bin_chunk: bytes, accessor_index: int) -> np.ndarray:
+    """Read one accessor as a (count, components) array, honoring byteStride."""
+    accessor = gltf["accessors"][int(accessor_index)]
+    component_type = int(accessor["componentType"])
+    dtype = _GLTF_COMPONENT_DTYPES[component_type]
+    components = _GLTF_TYPE_COMPONENTS[str(accessor["type"])]
+    count = int(accessor["count"])
+    if count <= 0:
+        return np.zeros((0, components), dtype=np.float32)
+    view_index = accessor.get("bufferView")
+    if view_index is None:
+        array = np.zeros((count, components), dtype=dtype)
+    else:
+        view = gltf["bufferViews"][int(view_index)]
+        start = int(view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
+        tight = dtype.itemsize * components
+        stride = int(view.get("byteStride") or tight)
+        if stride == tight:
+            array = np.frombuffer(bin_chunk, dtype=dtype, count=count * components, offset=start).reshape(count, components)
+        else:
+            span = stride * (count - 1) + tight
+            raw = np.frombuffer(bin_chunk, dtype=np.uint8, count=span, offset=start)
+            strided = np.lib.stride_tricks.as_strided(raw, shape=(count, tight), strides=(stride, 1))
+            array = np.ascontiguousarray(strided).view(dtype).reshape(count, components)
+    if accessor.get("normalized") and component_type in _GLTF_NORMALIZED_SCALE:
+        array = np.maximum(array.astype(np.float32) / _GLTF_NORMALIZED_SCALE[component_type], -1.0)
+    return array
+
+
+def _gltf_quaternion_matrix(quaternion: list) -> np.ndarray:
+    x, y, z, w = (float(quaternion[0]), float(quaternion[1]), float(quaternion[2]), float(quaternion[3]))
+    norm = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    matrix[0, 1] = 2.0 * (x * y - z * w)
+    matrix[0, 2] = 2.0 * (x * z + y * w)
+    matrix[1, 0] = 2.0 * (x * y + z * w)
+    matrix[1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    matrix[1, 2] = 2.0 * (y * z - x * w)
+    matrix[2, 0] = 2.0 * (x * z - y * w)
+    matrix[2, 1] = 2.0 * (y * z + x * w)
+    matrix[2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    return matrix
+
+
+def _gltf_local_matrix(node: dict) -> np.ndarray:
+    raw = node.get("matrix")
+    if isinstance(raw, list) and len(raw) == 16:
+        # glTF matrices are column-major.
+        return np.array(raw, dtype=np.float64).reshape(4, 4).T
+    matrix = np.eye(4, dtype=np.float64)
+    scale = node.get("scale")
+    if isinstance(scale, list) and len(scale) == 3:
+        matrix = np.diag([float(scale[0]), float(scale[1]), float(scale[2]), 1.0])
+    rotation = node.get("rotation")
+    if isinstance(rotation, list) and len(rotation) == 4:
+        matrix = _gltf_quaternion_matrix(rotation) @ matrix
+    translation = node.get("translation")
+    if isinstance(translation, list) and len(translation) == 3:
+        matrix[:3, 3] += np.array(translation[:3], dtype=np.float64)
+    return matrix
+
+
+def _gltf_node_parents(nodes: list) -> dict[int, int]:
+    parents: dict[int, int] = {}
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        for child in node.get("children") or []:
+            if isinstance(child, int) and 0 <= child < len(nodes):
+                parents.setdefault(child, index)
+    return parents
+
+
+def _gltf_global_matrices(nodes: list, parents: dict[int, int]) -> list[np.ndarray]:
+    globals_: list[np.ndarray | None] = [None] * len(nodes)
+
+    def resolve(index: int, visiting: frozenset[int]) -> np.ndarray:
+        cached = globals_[index]
+        if cached is not None:
+            return cached
+        local = _gltf_local_matrix(nodes[index]) if isinstance(nodes[index], dict) else np.eye(4, dtype=np.float64)
+        parent = parents.get(index)
+        if parent is None or parent in visiting:
+            matrix = local
+        else:
+            matrix = resolve(parent, visiting | {index}) @ local
+        globals_[index] = matrix
+        return matrix
+
+    return [resolve(index, frozenset({index})) for index in range(len(nodes))]
+
+
+def _vrm_preview_cache_dir(model_path: Path) -> Path:
+    try:
+        stat = model_path.stat()
+        token = f"{model_path}|{stat.st_mtime_ns}|{stat.st_size}"
+    except OSError:
+        token = str(model_path)
+    digest = hashlib.sha1(token.encode("utf-8", "replace")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"mci_vrm_preview_{digest}"
+
+
+def _extract_vrm_images(gltf: dict, bin_chunk: bytes, model_path: Path, warnings: list[str]) -> dict[int, Path]:
+    """Write embedded glTF images to a per-model temp cache and return file paths.
+
+    The existing texture decode/upload path works on plain files, so embedded
+    PNG/JPEG payloads are materialized once per (path, mtime, size) and reused.
+    """
+    images = gltf.get("images") or []
+    if not images:
+        return {}
+    cache_dir = _vrm_preview_cache_dir(model_path)
+    resolved: dict[int, Path] = {}
+    failures = 0
+    for index, image in enumerate(images):
+        if not isinstance(image, dict):
+            continue
+        suffix = _GLTF_IMAGE_EXTENSIONS.get(str(image.get("mimeType") or "").lower(), ".png")
+        blob: bytes | None = None
+        uri = image.get("uri")
+        if isinstance(uri, str) and uri:
+            if uri.startswith("data:"):
+                header, _, payload = uri.partition(",")
+                try:
+                    blob = base64.b64decode(payload)
+                except Exception:
+                    blob = None
+                mime = header[5:].split(";", 1)[0].lower()
+                suffix = _GLTF_IMAGE_EXTENSIONS.get(mime, suffix)
+            else:
+                candidate = model_path.parent / unquote(uri.replace("\\", "/"))
+                if candidate.exists():
+                    resolved[index] = candidate
+                continue
+        if blob is None:
+            view_index = image.get("bufferView")
+            if view_index is None:
+                continue
+            try:
+                view = gltf["bufferViews"][int(view_index)]
+                start = int(view.get("byteOffset", 0))
+                blob = bytes(bin_chunk[start : start + int(view.get("byteLength", 0))])
+            except Exception:
+                blob = None
+        if not blob:
+            continue
+        # Trust the payload over a missing/incorrect mimeType.
+        if blob[:8] == b"\x89PNG\r\n\x1a\n":
+            suffix = ".png"
+        elif blob[:3] == b"\xff\xd8\xff":
+            suffix = ".jpg"
+        target = cache_dir / f"image_{index:03d}{suffix}"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or target.stat().st_size != len(blob):
+                target.write_bytes(blob)
+            resolved[index] = target
+        except OSError:
+            failures += 1
+    if failures:
+        warnings.append(f"{failures} embedded texture(s) could not be written to the preview cache.")
+    return resolved
+
+
+def _vrm_material_image_index(gltf: dict, material_index: int) -> int:
+    """Resolve a glTF material to its base color source image index (or -1)."""
+    materials = gltf.get("materials") or []
+    material = materials[material_index] if 0 <= material_index < len(materials) else {}
+    if not isinstance(material, dict):
+        material = {}
+    base = (material.get("pbrMetallicRoughness") or {}).get("baseColorTexture") or {}
+    texture_index = base.get("index")
+    if texture_index is None:
+        # VRM 0.x MToon materials carry the main texture in materialProperties,
+        # aligned with the materials array.
+        properties = ((gltf.get("extensions") or {}).get("VRM") or {}).get("materialProperties") or []
+        if 0 <= material_index < len(properties) and isinstance(properties[material_index], dict):
+            texture_index = (properties[material_index].get("textureProperties") or {}).get("_MainTex")
+    if texture_index is None:
+        return -1
+    textures = gltf.get("textures") or []
+    if not (0 <= int(texture_index) < len(textures)):
+        return -1
+    source = textures[int(texture_index)].get("source") if isinstance(textures[int(texture_index)], dict) else None
+    return int(source) if source is not None else -1
+
+
+def _vrm_material_color(material: dict) -> tuple[float, float, float, float]:
+    factor = (material.get("pbrMetallicRoughness") or {}).get("baseColorFactor")
+    if isinstance(factor, list) and len(factor) >= 4:
+        try:
+            return (float(factor[0]), float(factor[1]), float(factor[2]), float(factor[3]))
+        except (TypeError, ValueError):
+            pass
+    return (1.0, 1.0, 1.0, 1.0)
+
+
+def _vrm_morph_count(gltf: dict) -> int:
+    extensions = gltf.get("extensions") or {}
+    groups = ((extensions.get("VRM") or {}).get("blendShapeMaster") or {}).get("blendShapeGroups")
+    if isinstance(groups, list) and groups:
+        return len(groups)
+    expressions = (extensions.get("VRMC_vrm") or {}).get("expressions")
+    if isinstance(expressions, dict):
+        total = sum(len(value) for value in (expressions.get("preset"), expressions.get("custom")) if isinstance(value, dict))
+        if total:
+            return total
+    total = 0
+    for mesh in gltf.get("meshes") or []:
+        if not isinstance(mesh, dict):
+            continue
+        counts = [len(primitive.get("targets") or []) for primitive in mesh.get("primitives") or [] if isinstance(primitive, dict)]
+        if counts:
+            total += max(counts)
+    return total
+
+
+def _computed_vertex_normals(positions: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    normals = np.zeros_like(positions, dtype=np.float32)
+    if len(indices) >= 3 and len(positions):
+        triangles = indices[: (len(indices) // 3) * 3].reshape(-1, 3).astype(np.int64)
+        edge1 = positions[triangles[:, 1]] - positions[triangles[:, 0]]
+        edge2 = positions[triangles[:, 2]] - positions[triangles[:, 0]]
+        face_normals = np.cross(edge1, edge2)
+        for column in range(3):
+            np.add.at(normals, triangles[:, column], face_normals)
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = (normals / np.maximum(lengths, 1e-8)).astype(np.float32)
+    return normals
+
+
+def _load_vrm_preview_model(model_path: Path) -> StaticPreviewModel:
+    """Parse a VRM (glTF 2.0 GLB) into the same structure as the PMX loader."""
+    warnings: list[str] = []
+    gltf, bin_chunk = _parse_glb(model_path.read_bytes())
+    nodes = gltf.get("nodes") or []
+    meshes = gltf.get("meshes") or []
+    parents = _gltf_node_parents(nodes)
+    global_matrices = _gltf_global_matrices(nodes, parents)
+    image_paths = _extract_vrm_images(gltf, bin_chunk, model_path, warnings)
+
+    positions_parts: list[np.ndarray] = []
+    normals_parts: list[np.ndarray] = []
+    uvs_parts: list[np.ndarray] = []
+    material_buckets: dict[int, list[np.ndarray]] = {}
+    vertex_offset = 0
+    identity = np.eye(4, dtype=np.float64)
+    for node_index, node in enumerate(nodes):
+        mesh_index = node.get("mesh") if isinstance(node, dict) else None
+        if mesh_index is None or not (0 <= int(mesh_index) < len(meshes)):
+            continue
+        mesh = meshes[int(mesh_index)]
+        if not isinstance(mesh, dict):
+            continue
+        # Skinned vertices are stored in bind/model space; per the glTF spec the
+        # node transform must be ignored for skinned meshes.
+        matrix = identity if node.get("skin") is not None else global_matrices[node_index]
+        apply_transform = not np.allclose(matrix, identity)
+        for primitive in mesh.get("primitives") or []:
+            if not isinstance(primitive, dict) or int(primitive.get("mode", 4)) != 4:
+                continue
+            attributes = primitive.get("attributes") or {}
+            if "POSITION" not in attributes:
+                continue
+            positions = _read_gltf_accessor(gltf, bin_chunk, attributes["POSITION"]).astype(np.float32)
+            if positions.shape[1] < 3:
+                continue
+            positions = np.ascontiguousarray(positions[:, :3])
+            count = len(positions)
+            normals = None
+            if "NORMAL" in attributes:
+                raw_normals = _read_gltf_accessor(gltf, bin_chunk, attributes["NORMAL"]).astype(np.float32)
+                if raw_normals.shape[1] >= 3 and len(raw_normals) == count:
+                    normals = np.ascontiguousarray(raw_normals[:, :3])
+            if "TEXCOORD_0" in attributes:
+                raw_uvs = _read_gltf_accessor(gltf, bin_chunk, attributes["TEXCOORD_0"]).astype(np.float32)
+                uvs = np.ascontiguousarray(raw_uvs[:, :2]) if raw_uvs.shape[1] >= 2 and len(raw_uvs) == count else np.zeros((count, 2), dtype=np.float32)
+            else:
+                uvs = np.zeros((count, 2), dtype=np.float32)
+            indices_accessor = primitive.get("indices")
+            if indices_accessor is None:
+                indices = np.arange(count, dtype=np.uint32)
+            else:
+                indices = _read_gltf_accessor(gltf, bin_chunk, indices_accessor).reshape(-1).astype(np.uint32)
+            if apply_transform:
+                linear = matrix[:3, :3].T.astype(np.float32)
+                positions = positions @ linear + matrix[:3, 3].astype(np.float32)
+                if normals is not None:
+                    normals = normals @ linear
+            if normals is None:
+                normals = _computed_vertex_normals(positions, indices)
+            material_index = primitive.get("material")
+            bucket = int(material_index) if isinstance(material_index, int) else -1
+            material_buckets.setdefault(bucket, []).append(indices + np.uint32(vertex_offset))
+            positions_parts.append(positions)
+            normals_parts.append(normals)
+            uvs_parts.append(uvs)
+            vertex_offset += count
+
+    if positions_parts:
+        all_positions = np.ascontiguousarray(np.concatenate(positions_parts, axis=0), dtype=np.float32)
+        all_normals = np.ascontiguousarray(np.concatenate(normals_parts, axis=0), dtype=np.float32)
+        all_uvs = np.ascontiguousarray(np.concatenate(uvs_parts, axis=0), dtype=np.float32)
+    else:
+        all_positions = np.zeros((0, 3), dtype=np.float32)
+        all_normals = np.zeros((0, 3), dtype=np.float32)
+        all_uvs = np.zeros((0, 2), dtype=np.float32)
+    if len(all_positions) > core.MAX_SUPPORTED_PMX_VERTEX_COUNT:
+        raise RuntimeError(
+            f"VRM vertex count {len(all_positions):,} exceeds the supported limit of "
+            f"{core.MAX_SUPPORTED_PMX_VERTEX_COUNT:,}. This model is too large for the importer."
+        )
+    # The PMX preview convention is left-handed Y-up, facing -Z, model's left
+    # on +X. VRM 0.x assets face -Z with the left side on -X (mirror X to
+    # match); VRM 1.0 / plain glTF assets face +Z with the left side on +X
+    # (mirror Z to match). Either way the default Front view shows the face.
+    mirror_axis = 0 if "VRM" in (gltf.get("extensions") or {}) else 2
+    all_positions[:, mirror_axis] *= -1.0
+    all_normals[:, mirror_axis] *= -1.0
+
+    # One contiguous index range per glTF material (mirrors PMX material spans).
+    gltf_materials = gltf.get("materials") or []
+    gltf_images = gltf.get("images") or []
+    materials: list[PreviewMaterial] = []
+    indices_parts: list[np.ndarray] = []
+    index_start = 0
+    for bucket in sorted(material_buckets, key=lambda value: (value < 0, value)):
+        chunks = material_buckets[bucket]
+        merged = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        material = gltf_materials[bucket] if 0 <= bucket < len(gltf_materials) and isinstance(gltf_materials[bucket], dict) else {}
+        name = str(material.get("name") or (f"material_{bucket}" if bucket >= 0 else "material"))
+        image_index = _vrm_material_image_index(gltf, bucket) if bucket >= 0 else -1
+        texture_path = image_paths.get(image_index) if image_index >= 0 else None
+        texture_ref = ""
+        if image_index >= 0 and 0 <= image_index < len(gltf_images) and isinstance(gltf_images[image_index], dict):
+            texture_ref = str(gltf_images[image_index].get("name") or gltf_images[image_index].get("uri") or f"image_{image_index}")
+        materials.append(
+            PreviewMaterial(
+                name=name,
+                diffuse=_vrm_material_color(material),
+                texture_path=texture_path,
+                index_start=index_start,
+                index_count=int(len(merged)),
+                texture_ref=texture_ref,
+                missing_texture=bool(image_index >= 0 and texture_path is None),
+            )
+        )
+        indices_parts.append(merged)
+        index_start += int(len(merged))
+    all_indices = np.concatenate(indices_parts) if indices_parts else np.zeros(0, dtype=np.uint32)
+
+    # Skeleton overlay: skin joints in encounter order, parented within joints.
+    joints: list[int] = []
+    seen: set[int] = set()
+    for skin in gltf.get("skins") or []:
+        if not isinstance(skin, dict):
+            continue
+        for joint in skin.get("joints") or []:
+            if isinstance(joint, int) and 0 <= joint < len(nodes) and joint not in seen:
+                seen.add(joint)
+                joints.append(joint)
+    node_to_bone = {node_index: bone_index for bone_index, node_index in enumerate(joints)}
+    bones: list[PreviewBone] = []
+    for node_index in joints:
+        matrix = global_matrices[node_index]
+        head = [float(matrix[0, 3]), float(matrix[1, 3]), float(matrix[2, 3])]
+        head[mirror_axis] = -head[mirror_axis]
+        position = (head[0], head[1], head[2])
+        parent = parents.get(node_index)
+        while parent is not None and parent not in node_to_bone:
+            parent = parents.get(parent)
+        node = nodes[node_index] if isinstance(nodes[node_index], dict) else {}
+        name = str(node.get("name") or f"node_{node_index}")
+        bones.append(PreviewBone(name=name, english_name=name, parent=node_to_bone[parent] if parent is not None else -1, position=position))
+
+    extensions = gltf.get("extensions") or {}
+    meta0 = (extensions.get("VRM") or {}).get("meta") or {}
+    meta1 = (extensions.get("VRMC_vrm") or {}).get("meta") or {}
+    model_name = str(meta0.get("title") or meta1.get("name") or model_path.stem)
+
+    unresolved = sum(1 for material in materials if material.missing_texture)
+    if unresolved:
+        warnings.append(f"{unresolved} material(s) have no resolved preview texture.")
+    return StaticPreviewModel(
+        path=model_path,
+        name=model_name,
+        english_name=model_name,
+        positions=all_positions,
+        normals=all_normals,
+        uvs=all_uvs,
+        indices=all_indices,
+        materials=materials,
+        bones=bones,
+        morph_count=_vrm_morph_count(gltf),
+        texture_count=len(gltf_images),
         warnings=warnings,
     )
 
@@ -587,7 +1049,7 @@ class StaticModelPreviewWidget(QOpenGLWidget):
             if not self.model:
                 painter.fillRect(self.rect(), QtGui.QColor(22, 24, 27))
                 painter.setPen(QtGui.QColor(230, 230, 230))
-                painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "Select a PMX model to preview.")
+                painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "Select a PMX/VRM model to preview.")
             elif not GL:
                 painter.fillRect(self.rect(), QtGui.QColor(22, 24, 27))
                 painter.setPen(QtGui.QColor(255, 210, 120))

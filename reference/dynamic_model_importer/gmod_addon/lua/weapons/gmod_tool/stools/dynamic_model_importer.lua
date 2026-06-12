@@ -263,7 +263,7 @@ function TOOL.BuildCPanel(panel)
     weapon:AddChoice("AR2", "weapon_ar2")
     weapon:AddChoice(L("Shotgun"), "weapon_shotgun")
     weapon:AddChoice(L("Pistol"), "weapon_pistol")
-    weapon:AddChoice(L("None"), "")
+    weapon:AddChoice(L("None"), "none")
     weapon.OnSelect = function(_, _, _, data)
         RunConsoleCommand("dynamic_model_importer_weapon", tostring(data or ""))
     end

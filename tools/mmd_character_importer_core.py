@@ -48,6 +48,7 @@ L4D2_TOOLS_ZIP = PLUGIN_DIR / "Blender_L4D2_Character_Tools-main.zip"
 BLENDER_SETUP_SCRIPT = TOOLS_DIR / "blender_setup_addons.py"
 SETUP_REQUIREMENTS_VERSION = 8
 BLENDER_IMPORT_SCRIPT = TOOLS_DIR / "blender_import_mmd_model.py"
+BLENDER_VRM_IMPORT_SCRIPT = TOOLS_DIR / "blender_import_vrm_model.py"
 BLENDER_FIX_SCRIPT = TOOLS_DIR / "blender_fix_mmd_model.py"
 BLENDER_SPINE_SCRIPT = TOOLS_DIR / "blender_fix_spine_bones.py"
 BLENDER_SORT_BONES_SCRIPT = TOOLS_DIR / "blender_sort_bones.py"
@@ -175,6 +176,25 @@ REQUIRED_MMD_SKELETON_BONES: tuple[tuple[str, str], ...] = (
     ("\u53f3\u8db3", "legR"),
     ("\u53f3\u3072\u3056", "kneeR"),
     ("\u53f3\u8db3\u9996", "ankleR"),
+)
+
+
+VRM_REQUIRED_HUMANOID_BONES: tuple[str, ...] = (
+    "hips",
+    "spine",
+    "head",
+    "leftUpperArm",
+    "leftLowerArm",
+    "leftHand",
+    "leftUpperLeg",
+    "leftLowerLeg",
+    "leftFoot",
+    "rightUpperArm",
+    "rightLowerArm",
+    "rightHand",
+    "rightUpperLeg",
+    "rightLowerLeg",
+    "rightFoot",
 )
 
 
@@ -2336,11 +2356,195 @@ def analyze_pmx(pmx_path: Path, source_dir: Path | None = None) -> PmxAnalysis:
     return analysis
 
 
+def read_glb_json(path: Path) -> dict:
+    """Read the JSON chunk from a GLB container (used by .vrm files)."""
+
+    with path.open("rb") as handle:
+        header = handle.read(12)
+        if len(header) < 12 or header[:4] != b"glTF":
+            raise ValueError(f"not a GLB/VRM file: invalid magic in {path}")
+        while True:
+            chunk_header = handle.read(8)
+            if len(chunk_header) < 8:
+                break
+            chunk_length, chunk_type = struct.unpack("<I4s", chunk_header)
+            chunk_data = handle.read(chunk_length)
+            if len(chunk_data) < chunk_length:
+                raise ValueError(f"truncated GLB chunk in {path}")
+            if chunk_type == b"JSON":
+                return json.loads(chunk_data.decode("utf-8"))
+    raise ValueError(f"no JSON chunk found in GLB/VRM file: {path}")
+
+
+def vrm_extension_info(gltf: dict) -> tuple[str, dict, dict[str, int]]:
+    """Return (vrm spec version, vrm extension dict, humanoid slot -> node index map)."""
+
+    extensions = gltf.get("extensions") or {}
+    vrm1 = extensions.get("VRMC_vrm")
+    if isinstance(vrm1, dict):
+        bone_map: dict[str, int] = {}
+        human_bones = (vrm1.get("humanoid") or {}).get("humanBones") or {}
+        if isinstance(human_bones, dict):
+            for slot, info in human_bones.items():
+                node = info.get("node") if isinstance(info, dict) else None
+                if isinstance(node, int):
+                    bone_map[str(slot)] = node
+        return str(vrm1.get("specVersion") or "1.0"), vrm1, bone_map
+    vrm0 = extensions.get("VRM")
+    if isinstance(vrm0, dict):
+        bone_map = {}
+        entries = (vrm0.get("humanoid") or {}).get("humanBones") or []
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("node"), int) and entry.get("bone"):
+                    bone_map.setdefault(str(entry["bone"]), entry["node"])
+        return str(vrm0.get("specVersion") or "0.0"), vrm0, bone_map
+    return "", {}, {}
+
+
+def vrm_morph_groups(vrm_version: str, vrm_extension: dict, gltf: dict) -> list[str]:
+    """Return VRM blendshape/expression group names (or per-mesh target names as fallback)."""
+
+    names: list[str] = []
+    if vrm_version.startswith("1"):
+        expressions = vrm_extension.get("expressions") or {}
+        for section in ("preset", "custom"):
+            section_data = expressions.get(section)
+            if isinstance(section_data, dict):
+                names.extend(str(key) for key in section_data.keys())
+        if names:
+            return names
+    else:
+        groups = (vrm_extension.get("blendShapeMaster") or {}).get("blendShapeGroups") or []
+        if isinstance(groups, list):
+            for group in groups:
+                if isinstance(group, dict):
+                    label = str(group.get("name") or group.get("presetName") or "").strip()
+                    if label:
+                        names.append(label)
+        if names:
+            return names
+    for mesh in gltf.get("meshes") or []:
+        target_names = (mesh.get("extras") or {}).get("targetNames")
+        if isinstance(target_names, list):
+            names.extend(str(name) for name in target_names if str(name).strip())
+        else:
+            target_count = max(
+                (len(primitive.get("targets") or []) for primitive in mesh.get("primitives") or []),
+                default=0,
+            )
+            names.extend(f"{mesh.get('name') or 'mesh'}_morph_{index}" for index in range(target_count))
+    return names
+
+
+def analyze_vrm(vrm_path: Path, source_dir: Path | None = None) -> PmxAnalysis:
+    vrm_path = vrm_path.resolve()
+    source_dir = (source_dir or vrm_path.parent).resolve()
+    if not vrm_path.exists():
+        raise FileNotFoundError(vrm_path)
+    if not vrm_path.is_file():
+        raise FileNotFoundError(f"VRM path is not a file: {vrm_path}")
+
+    analysis = PmxAnalysis(pmx_path=str(vrm_path), source_dir=str(source_dir))
+    gltf = read_glb_json(vrm_path)
+    vrm_version, vrm_extension, bone_map = vrm_extension_info(gltf)
+    meta = vrm_extension.get("meta") or {}
+    model_name = str(meta.get("name") or meta.get("title") or "").strip() or vrm_path.stem
+    analysis.model_name = model_name
+    analysis.model_name_english = model_name
+    analysis.version = vrm_version or "0.0"
+    analysis.encoding = "glb"
+
+    accessors = gltf.get("accessors") or []
+    bounds_min = [float("inf"), float("inf"), float("inf")]
+    bounds_max = [float("-inf"), float("-inf"), float("-inf")]
+    for mesh in gltf.get("meshes") or []:
+        for primitive in mesh.get("primitives") or []:
+            position_index = (primitive.get("attributes") or {}).get("POSITION")
+            if isinstance(position_index, int) and 0 <= position_index < len(accessors):
+                accessor = accessors[position_index]
+                analysis.vertex_count += int(accessor.get("count") or 0)
+                accessor_min = accessor.get("min")
+                accessor_max = accessor.get("max")
+                if isinstance(accessor_min, list) and isinstance(accessor_max, list) and len(accessor_min) >= 3 and len(accessor_max) >= 3:
+                    for axis in range(3):
+                        bounds_min[axis] = min(bounds_min[axis], float(accessor_min[axis]))
+                        bounds_max[axis] = max(bounds_max[axis], float(accessor_max[axis]))
+            indices_index = primitive.get("indices")
+            if isinstance(indices_index, int) and 0 <= indices_index < len(accessors):
+                analysis.face_count += int(accessors[indices_index].get("count") or 0) // 3
+    if analysis.vertex_count > MAX_SUPPORTED_PMX_VERTEX_COUNT:
+        raise RuntimeError(
+            f"VRM vertex count {analysis.vertex_count:,} exceeds the supported limit of "
+            f"{MAX_SUPPORTED_PMX_VERTEX_COUNT:,}. This model is too large for the importer."
+        )
+    # glTF is Y-up like PMX, so the model height is the Y extent (axis index 1).
+    model_height = (
+        bounds_max[1] - bounds_min[1]
+        if all(math.isfinite(value) for value in (bounds_min[1], bounds_max[1]))
+        else 0.0
+    )
+
+    joint_nodes: set[int] = set()
+    for skin in gltf.get("skins") or []:
+        joint_nodes.update(index for index in skin.get("joints") or [] if isinstance(index, int))
+    analysis.bone_count = len(joint_nodes)
+
+    morph_names = vrm_morph_groups(vrm_version, vrm_extension, gltf)
+    analysis.morph_count = len(morph_names)
+    analysis.morph_names = morph_names
+
+    analysis.material_count = len(gltf.get("materials") or [])
+    image_count = len(gltf.get("images") or [])
+    analysis.texture_ref_count = image_count
+    analysis.texture_file_count = image_count
+    analysis.resolved_texture_count = image_count
+
+    warnings: list[str] = []
+    if not bone_map:
+        analysis.missing_required_skeleton_bones = list(VRM_REQUIRED_HUMANOID_BONES)
+        warnings.append(
+            "VRM humanoid extension is missing: no humanoid bone mapping was found. "
+            "Import is expected to fail because the skeleton cannot be converted to a humanoid rig."
+        )
+    else:
+        missing_slots = [slot for slot in VRM_REQUIRED_HUMANOID_BONES if slot not in bone_map]
+        analysis.missing_required_skeleton_bones = missing_slots
+        if missing_slots:
+            warnings.append(
+                "VRM humanoid bone mapping is incomplete: missing required humanoid bones: "
+                + ", ".join(missing_slots)
+            )
+    if analysis.vertex_count <= 0:
+        warnings.append("No mesh vertices were found in the VRM file.")
+    if model_height <= 0.0:
+        warnings.append("Could not determine the model height from the VRM position accessors.")
+    if analysis.vertex_count > HIGH_PMX_VERTEX_WARNING_THRESHOLD:
+        warnings.append(
+            f"High vertex count: {analysis.vertex_count:,} vertices; "
+            "importing may take a long time and produce unexpected results."
+        )
+    if analysis.bone_count > 600:
+        warnings.append(f"High bone count: {analysis.bone_count:,} bones; importing may be slow.")
+    if analysis.morph_count > 96:
+        warnings.append(f"High morph/shapekey count: {analysis.morph_count:,}; later flex work may be slow.")
+    analysis.warnings = warnings
+    return analysis
+
+
+def analyze_model_file(path: Path, source_dir: Path | None = None) -> PmxAnalysis:
+    """Analyze a supported model file (.pmx or .vrm) by extension."""
+
+    if path.suffix.lower() == ".vrm":
+        return analyze_vrm(path, source_dir)
+    return analyze_pmx(path, source_dir)
+
+
 def build_workspace(pmx_path: Path, source_dir: Path, analysis: PmxAnalysis | None = None, workspace_root: Path | None = None) -> Workspace:
     source_dir = source_dir.resolve()
     pmx_path = pmx_path.resolve()
     if analysis is None:
-        analysis = analyze_pmx(pmx_path, source_dir)
+        analysis = analyze_model_file(pmx_path, source_dir)
     model_label = analysis.model_name_english or analysis.model_name or pmx_path.stem
     slug = slugify(model_label)
     digest = file_sha1(pmx_path)[:10]
@@ -2776,7 +2980,7 @@ def import_pmx_to_blender(
             "Select the folder that contains the PMX file as the source directory."
         )
     if analysis is None:
-        analysis = analyze_pmx(pmx_path, source_dir)
+        analysis = analyze_model_file(pmx_path, source_dir)
     workspace = build_workspace(pmx_path, source_dir, analysis, workspace_root=workspace_root)
     workspace.import_dir.mkdir(parents=True, exist_ok=True)
     workspace.preflight_report_path.write_text(analysis.to_json(), encoding="utf-8")
@@ -2786,6 +2990,8 @@ def import_pmx_to_blender(
         raise FileNotFoundError(f"copied PMX was not found: {workspace.copied_pmx}")
 
     setup = ensure_portable_blender(progress, cancel_check=cancel_check)
+    is_vrm = pmx_path.suffix.lower() == ".vrm"
+    import_script = BLENDER_VRM_IMPORT_SCRIPT if is_vrm else BLENDER_IMPORT_SCRIPT
     command = [
         str(setup.blender_exe),
         "--background",
@@ -2793,15 +2999,17 @@ def import_pmx_to_blender(
         "--python-exit-code",
         "1",
         "--python",
-        str(BLENDER_IMPORT_SCRIPT),
+        str(import_script),
         "--",
-        "--pmx",
+        "--vrm" if is_vrm else "--pmx",
         str(workspace.copied_pmx),
         "--output-blend",
         str(workspace.blend_path),
         "--report-json",
         str(workspace.import_report_path),
     ]
+    if is_vrm:
+        command += ["--textures-dir", str(workspace.source_assets_dir / "vrm_textures")]
     emit(progress, f"Starting Blender import: {workspace.copied_pmx}")
     started = time.monotonic()
     run_process_streamed(
@@ -5059,10 +5267,15 @@ def generate_release_description(
     )
 
 
-def find_pmx_files(folder: Path) -> list[Path]:
+def find_model_files(folder: Path) -> list[Path]:
     if not folder.exists() or not folder.is_dir():
         return []
-    return sorted(folder.rglob("*.pmx"), key=lambda path: (-path.stat().st_size, str(path).lower()))
+    matches = list(folder.rglob("*.pmx")) + list(folder.rglob("*.vrm"))
+    return sorted(matches, key=lambda path: (-path.stat().st_size, str(path).lower()))
+
+
+def find_pmx_files(folder: Path) -> list[Path]:
+    return find_model_files(folder)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5075,14 +5288,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    analyze_parser = subparsers.add_parser("analyze", help="analyze a PMX file")
+    analyze_parser = subparsers.add_parser("analyze", help="analyze a PMX or VRM model file")
     analyze_parser.add_argument("pmx", type=Path)
     analyze_parser.add_argument("--source-dir", type=Path)
 
     setup_parser = subparsers.add_parser("setup", help="install/verify portable Blender and add-ons")
     setup_parser.add_argument("--force-check", action="store_true")
 
-    import_parser = subparsers.add_parser("import", help="copy assets and import PMX into Blender")
+    import_parser = subparsers.add_parser("import", help="copy assets and import a PMX or VRM model into Blender")
     import_parser.add_argument("pmx", type=Path)
     import_parser.add_argument("--source-dir", type=Path, required=True)
 
@@ -5251,7 +5464,7 @@ def main(argv: list[str] | None = None) -> int:
         print(message, flush=True)
 
     if args.command == "analyze":
-        result = analyze_pmx(args.pmx, args.source_dir)
+        result = analyze_model_file(args.pmx, args.source_dir)
         print(result.to_json())
         return 0
     if args.command == "setup":

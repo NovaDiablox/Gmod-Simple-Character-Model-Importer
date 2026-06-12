@@ -2483,7 +2483,7 @@ class MainPmxAnalyzeWorker(QtCore.QThread):
         try:
             pmx = Path(self.pmx_path)
             source = Path(self.source_dir)
-            analysis = core.analyze_pmx(pmx, source)
+            analysis = core.analyze_model_file(pmx, source)
             custom_root = Path(self.workspace_root) if self.workspace_root else None
             workspace = core.build_workspace(pmx, source, analysis, workspace_root=custom_root)
             self.done.emit(analysis, workspace)
@@ -4017,7 +4017,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             intro.setText(
                 self._t(
                     "main.intro",
-                    "One-click import runs the default workflow from PMX import through QC compile and addon packaging. "
+                    "One-click import runs the default workflow from PMX/VRM import through QC compile and addon packaging. "
                     "Advanced tabs remain available for manual correction when a step needs attention.",
                 )
             )
@@ -4027,7 +4027,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self._set_path_row_text(
                 self.main_source_row,
                 self._t("main.mmd_folder", "MMD model folder"),
-                self._t("main.mmd_folder_hint", "Folder containing the selected PMX and texture files"),
+                self._t("main.mmd_folder_hint", "Folder containing the selected PMX/VRM and texture files"),
             )
         if hasattr(self, "main_gmod_row"):
             self._set_path_row_text(
@@ -4036,11 +4036,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self._t("main.gmod_hint", "Browse to studiomdl.exe or the Garry's Mod install folder"),
             )
         if hasattr(self, "main_pmx_label"):
-            self.main_pmx_label.setText(self._t("main.pmx_model", "PMX model"))
+            self.main_pmx_label.setText(self._t("main.pmx_model", "PMX/VRM model"))
         if hasattr(self, "main_pmx_badge"):
             self.main_pmx_badge.setText(self._t("common.required", "Required"))
         if hasattr(self, "main_pmx_hint"):
-            self.main_pmx_hint.setText(self._t("main.pmx_model_hint", "Defaults to the largest PMX in the selected folder"))
+            self.main_pmx_hint.setText(self._t("main.pmx_model_hint", "Defaults to the largest PMX/VRM in the selected folder"))
         if hasattr(self, "main_refresh_pmx_button"):
             self.main_refresh_pmx_button.setText(self._t("common.refresh", "Refresh"))
         for key, widget in getattr(self, "main_form_labels", {}).items():
@@ -4973,7 +4973,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         layout.setSpacing(8)
 
         self.main_intro_label = QtWidgets.QLabel(
-            "One-click import runs the default workflow from PMX import through QC compile and addon packaging. "
+            "One-click import runs the default workflow from PMX/VRM import through QC compile and addon packaging. "
             "Advanced tabs remain available for manual correction when a step needs attention."
         )
         self.main_intro_label.setObjectName("fieldHint")
@@ -5034,16 +5034,16 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "MMD model folder",
             "dir",
             required=True,
-            hint="Folder containing the selected PMX and texture files",
+            hint="Folder containing the selected PMX/VRM and texture files",
         )
         layout.addWidget(self.main_source_row)
 
         pmx_layout = QtWidgets.QGridLayout()
         pmx_header = QtWidgets.QHBoxLayout()
-        self.main_pmx_label = QtWidgets.QLabel("PMX model")
+        self.main_pmx_label = QtWidgets.QLabel("PMX/VRM model")
         self.main_pmx_badge = QtWidgets.QLabel("Required")
         self.main_pmx_badge.setObjectName("requiredBadge")
-        self.main_pmx_hint = QtWidgets.QLabel("Defaults to the largest PMX in the selected folder")
+        self.main_pmx_hint = QtWidgets.QLabel("Defaults to the largest PMX/VRM in the selected folder")
         self.main_pmx_hint.setObjectName("fieldHint")
         pmx_header.addWidget(self.main_pmx_label)
         pmx_header.addWidget(self.main_pmx_badge)
@@ -5133,7 +5133,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
         self.main_preflight_group = QtWidgets.QGroupBox("Preflight")
         preflight_layout = QtWidgets.QVBoxLayout(self.main_preflight_group)
-        self.main_stats_label = QtWidgets.QLabel("Select a PMX and run preflight.")
+        self.main_stats_label = QtWidgets.QLabel("Select a PMX/VRM and run preflight.")
         self.main_stats_label.setWordWrap(True)
         self.main_stats_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.main_warning_label = QtWidgets.QLabel("")
@@ -5404,16 +5404,16 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "MMD model folder",
             "dir",
             required=True,
-            hint="Folder containing the selected PMX and texture files",
+            hint="Folder containing the selected PMX/VRM and texture files",
         )
         layout.addWidget(self.source_row)
 
         pmx_layout = QtWidgets.QGridLayout()
         pmx_header = QtWidgets.QHBoxLayout()
-        self.pmx_label = QtWidgets.QLabel("PMX model")
+        self.pmx_label = QtWidgets.QLabel("PMX/VRM model")
         pmx_badge = QtWidgets.QLabel("Required")
         pmx_badge.setObjectName("requiredBadge")
-        self.pmx_hint = QtWidgets.QLabel("Defaults to the largest PMX in the selected folder")
+        self.pmx_hint = QtWidgets.QLabel("Defaults to the largest PMX/VRM in the selected folder")
         self.pmx_hint.setObjectName("fieldHint")
         pmx_header.addWidget(self.pmx_label)
         pmx_header.addWidget(pmx_badge)
@@ -5444,7 +5444,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
         self.preflight_group = QtWidgets.QGroupBox("Preflight")
         preflight_layout = QtWidgets.QVBoxLayout(self.preflight_group)
-        self.stats_label = QtWidgets.QLabel("Select a PMX and run Analyze.")
+        self.stats_label = QtWidgets.QLabel("Select a PMX/VRM and run Analyze.")
         self.stats_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.stats_label.setWordWrap(True)
         self.warning_label = QtWidgets.QLabel("")
@@ -9467,7 +9467,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.current_main_analysis = None
         self.current_main_workspace = None
         self.main_workspace_edit.clear()
-        self.main_stats_label.setText("Refresh PMX files, then run preflight.")
+        self.main_stats_label.setText("Refresh PMX/VRM files, then run preflight.")
         self.main_warning_label.clear()
         if hasattr(self, "main_model_name_edit"):
             self.main_model_name_edit.clear()
@@ -9487,7 +9487,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_pmx_combo.blockSignals(True)
         self.main_pmx_combo.clear()
         if source and source.exists():
-            self.main_pmx_paths = core.find_pmx_files(source)
+            self.main_pmx_paths = core.find_model_files(source)
             for path in self.main_pmx_paths:
                 try:
                     label = str(path.relative_to(source))
@@ -9509,7 +9509,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.set_main_model_name_from_candidate(self.main_model_name_candidate(self.current_main_pmx_path()), force=True)
             self.analyze_main_pmx(silent=True, reset_model_name=reset_model_name)
         else:
-            self.main_stats_label.setText("No .pmx files found in the selected folder.")
+            self.main_stats_label.setText("No .pmx or .vrm files found in the selected folder.")
             self.main_warning_label.clear()
 
     def on_main_pmx_changed(self, _index: int) -> None:
@@ -9580,11 +9580,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         source_raw = self.main_source_row.value()
         if not pmx or not source_raw:
             if not silent:
-                self.show_error("Preflight failed", "Select a model folder and PMX file first.")
+                self.show_error("Preflight failed", "Select a model folder and PMX/VRM file first.")
             return
         self._main_analyze_generation += 1
         generation = self._main_analyze_generation
-        self.main_stats_label.setText(self._t("main.analyzing", "Analyzing the selected PMX..."))
+        self.main_stats_label.setText(self._t("main.analyzing", "Analyzing the selected model..."))
         worker = MainPmxAnalyzeWorker(str(pmx), source_raw, self.main_workspace_edit.text().strip())
         worker.done.connect(
             lambda analysis, workspace, gen=generation: self._main_analyze_done(
@@ -9620,7 +9620,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         elif not self.main_model_name_edit.text().strip():
             self.set_main_model_name_from_candidate(candidate, force=False)
         if not silent:
-            self.append_main_log(f"Analyzed PMX: {analysis.pmx_path}")
+            self.append_main_log(f"Analyzed model: {analysis.pmx_path}")
             if show_special_warning_dialog:
                 self.show_special_preflight_warning_dialog(analysis)
         self.save_settings()
@@ -9634,7 +9634,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.current_main_analysis = None
         self.current_main_workspace = None
         self.main_workspace_edit.clear()
-        self.main_stats_label.setText("Could not analyze the selected PMX.")
+        self.main_stats_label.setText("Could not analyze the selected model.")
         self.main_warning_label.setText(f'<span style="color:#f85149;">{html.escape(message)}</span>')
         if self.main_model_preview is not None:
             self.main_model_preview.clear_model()
@@ -9646,7 +9646,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             f"Model: {analysis.model_name or Path(analysis.pmx_path).stem}"
             f" | Vertices: {analysis.vertex_count:,}"
             f" | Morphs: {analysis.morph_count:,}"
-            f" | PMX textures: {analysis.texture_ref_count:,}"
+            f" | Model textures: {analysis.texture_ref_count:,}"
             f" | Resolved textures: {analysis.resolved_texture_count:,}/{analysis.texture_ref_count:,}"
             f" | Bones: {analysis.bone_count:,}"
             f" | Materials: {analysis.material_count:,}"
@@ -9673,7 +9673,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 f"{len(model.bones):,} bones | {model.morph_count:,} morphs | {len(model.materials):,} materials"
             )
             if not silent:
-                self.append_main_log(f"Loaded PMX preview: {pmx}")
+                self.append_main_log(f"Loaded model preview: {pmx}")
         except Exception as exc:
             self.main_model_preview.clear_model()
             self.main_preview_status_label.setText(f"Preview failed: {exc}")
@@ -10093,7 +10093,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def validate_main_import_inputs(self) -> list[str]:
         errors: list[str] = []
         if not self.current_main_pmx_path():
-            errors.append("Select a PMX model.")
+            errors.append("Select a PMX/VRM model.")
         if not self.main_source_row.value():
             errors.append("Select the MMD model folder.")
         gmod = self.main_gmod_row.value().strip()
@@ -10153,7 +10153,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if analysis is None or self.current_main_workspace is None:
             # Preflight has not finished (or selection changed); run it on the
             # worker thread and continue automatically once it is ready.
-            self.statusBar().showMessage(self._t("main.analyzing", "Analyzing the selected PMX..."), 5000)
+            self.statusBar().showMessage(self._t("main.analyzing", "Analyzing the selected model..."), 5000)
             self.analyze_main_pmx(silent=False, on_ready=self._start_full_import_with_analysis)
             return
         self._start_full_import_with_analysis(analysis)
@@ -10217,7 +10217,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         return self.confirm_preflight_warnings(
             analysis,
             self._t("preflight.title", "Preflight warnings"),
-            self._t("preflight.generic_full_import", "The PMX has warnings. Proceed with the full import?"),
+            self._t("preflight.generic_full_import", "The model has warnings. Proceed with the full import?"),
             full_import=True,
         )
 
@@ -11029,7 +11029,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.current_workspace = None
         self.open_workspace_button.setEnabled(False)
         self.workspace_edit.clear()
-        self.stats_label.setText("Refresh PMX files, then run Analyze.")
+        self.stats_label.setText("Refresh PMX/VRM files, then run Analyze.")
         self.warning_label.clear()
         if self.model_preview is not None:
             self.model_preview.clear_model()
@@ -11043,7 +11043,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.pmx_combo.blockSignals(True)
         self.pmx_combo.clear()
         if source and source.exists():
-            self.pmx_paths = core.find_pmx_files(source)
+            self.pmx_paths = core.find_model_files(source)
             for path in self.pmx_paths:
                 try:
                     label = str(path.relative_to(source))
@@ -11063,7 +11063,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if self.pmx_paths:
             self.analyze_current_pmx(silent=True)
         else:
-            self.stats_label.setText("No .pmx files found in the selected folder.")
+            self.stats_label.setText("No .pmx or .vrm files found in the selected folder.")
             self.warning_label.clear()
 
     def on_pmx_changed(self, _index: int) -> None:
@@ -11089,11 +11089,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         source_raw = self.source_row.value()
         if not pmx or not source_raw:
             if not silent:
-                self.show_error("Analyze failed", "Select a model folder and PMX file first.")
+                self.show_error("Analyze failed", "Select a model folder and PMX/VRM file first.")
             return None
         try:
             source = Path(source_raw)
-            analysis = core.analyze_pmx(pmx, source)
+            analysis = core.analyze_model_file(pmx, source)
             custom_root = Path(self.workspace_edit.text().strip()) if self.workspace_edit.text().strip() else None
             workspace = core.build_workspace(pmx, source, analysis, workspace_root=custom_root)
             self.current_analysis = analysis
@@ -11123,7 +11123,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             f"Model: {analysis.model_name or Path(analysis.pmx_path).stem}"
             f" | Vertices: {analysis.vertex_count:,}"
             f" | Morphs: {analysis.morph_count:,}"
-            f" | PMX textures: {analysis.texture_ref_count:,}"
+            f" | Model textures: {analysis.texture_ref_count:,}"
             f" | Resolved textures: {analysis.resolved_texture_count:,}/{analysis.texture_ref_count:,}"
             f" | Native texture files: {analysis.texture_file_count:,}"
             f" | Bones: {analysis.bone_count:,}"
@@ -11137,7 +11137,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.warning_label.setText(f'<span style="color:#2ea043;">{html.escape(self._t("preflight.no_warnings", "No preflight warnings."))}</span>')
 
     def render_error_analysis(self, exc: Exception) -> None:
-        self.stats_label.setText("Could not analyze the selected PMX.")
+        self.stats_label.setText("Could not analyze the selected model.")
         self.warning_label.setText(f'<span style="color:#f85149;">{html.escape(str(exc))}</span>')
         if self.model_preview is not None:
             self.model_preview.clear_model()
@@ -11156,7 +11156,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 f"{len(model.bones):,} bones | {model.morph_count:,} morphs | {len(model.materials):,} materials"
             )
             if not silent:
-                self.append_log(f"Loaded PMX preview: {pmx}")
+                self.append_log(f"Loaded model preview: {pmx}")
         except Exception as exc:
             self.model_preview.clear_model()
             self.preview_status_label.setText(f"Preview failed: {exc}")
@@ -11169,7 +11169,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         return self.confirm_preflight_warnings(
             analysis,
             self._t("preflight.title", "Preflight warnings"),
-            self._t("preflight.generic_import", "The PMX has warnings. Proceed with import?"),
+            self._t("preflight.generic_import", "The model has warnings. Proceed with import?"),
             full_import=False,
         )
 
@@ -11231,7 +11231,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             report_path=str(result.get("report", "")),
             validation={"ok": True},
         )
-        QtWidgets.QMessageBox.information(self, "Import complete", "The PMX was imported and saved as a Blender file.")
+        QtWidgets.QMessageBox.information(self, "Import complete", "The model was imported and saved as a Blender file.")
 
     def import_failed(self, message: str) -> None:
         self.import_button.setEnabled(True)

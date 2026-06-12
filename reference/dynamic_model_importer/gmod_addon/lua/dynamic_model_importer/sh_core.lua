@@ -939,10 +939,28 @@ parse_legacy_autorun = function(path)
             player_model = pmPath or "",
         },
         legacy = true,
+        -- Mirror the data_static manifest schema: spawn_npc reads the
+        -- per-relation specs for class/keyvalues. Without citizentype = 4,
+        -- npc_citizen swaps custom models for models/Humans/Group01/<name>.mdl.
         npc_defaults = {
             relation = "friendly",
             health = 100,
             weapon = "weapon_smg1",
+            friendly = {
+                class = "npc_citizen",
+                weapon = "weapon_smg1",
+                keyvalues = { citizentype = "4" },
+            },
+            hostile = {
+                class = "npc_combine_s",
+                weapon = "weapon_ar2",
+                keyvalues = { Numgrenades = "4" },
+            },
+            neutral = {
+                class = "npc_citizen",
+                weapon = "weapon_smg1",
+                keyvalues = { citizentype = "4" },
+            },
         },
     }
     return manifest_to_entry(manifest, id)
@@ -989,6 +1007,11 @@ end
 
 local function sanitize_weapon(value)
     value = tostring(value or ""):gsub("[^%w_]", "")
+    -- "none" is an explicit request to spawn unarmed; "" means "use the
+    -- manifest's default weapon".
+    if string.lower(value) == "none" then
+        return "none"
+    end
     if value ~= "" and not starts_with(value, "weapon_") then
         return ""
     end
@@ -1436,8 +1459,17 @@ if SERVER then
         ent:SetPos(pos)
         ent:SetAngles(ang)
         ent:SetModel(modelPath)
+        local hasCitizenType = false
         for key, val in pairs(istable(spec.keyvalues) and spec.keyvalues or {}) do
             ent:SetKeyValue(tostring(key), tostring(val))
+            if string.lower(tostring(key)) == "citizentype" then
+                hasCitizenType = true
+            end
+        end
+        if class == "npc_citizen" and not hasCitizenType then
+            -- CT_UNIQUE: without this npc_citizen replaces custom models with
+            -- its default models/Humans/Group01 set on Spawn().
+            ent:SetKeyValue("citizentype", "4")
         end
         if weapon ~= "" then
             ent:SetKeyValue("additionalequipment", weapon)
@@ -1506,10 +1538,15 @@ if SERVER then
         if action == "ragdoll" then
             return spawn_ragdoll(ply, manifest, trace)
         end
-        if weapon == "" then
+        if weapon == "none" then
+            -- Explicit "None": spawn unarmed instead of falling back to the
+            -- manifest's default weapon.
+            weapon = ""
+        elseif weapon == "" then
             local defaults = istable(manifest.npc_defaults) and manifest.npc_defaults or {}
             local relationSpec = istable(defaults[relation]) and defaults[relation] or {}
             weapon = sanitize_weapon(relationSpec.weapon or defaults.weapon or "")
+            if weapon == "none" then weapon = "" end
         end
         return spawn_npc(ply, manifest, relation, health, weapon, trace)
     end
