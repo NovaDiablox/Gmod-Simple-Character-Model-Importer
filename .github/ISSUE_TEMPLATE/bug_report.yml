@@ -14,7 +14,7 @@ body:
       label: Details
       description: |
         Tell us exactly what happens here, every single detail that you can think of.  
-        Please include information such as the console log if possible (opened in-game by pressing SHIFT+ESC)
+        Please include information such as the console log if possible.
       placeholder: Describe the issue here..
     validations:
       required: true
