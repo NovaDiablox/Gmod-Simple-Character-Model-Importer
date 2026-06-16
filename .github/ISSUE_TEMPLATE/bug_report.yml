@@ -1,0 +1,49 @@
+name: "Bug report"
+description: "Create a bug report to help us improve the GModSCMI"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before reporting an issue, please do the following:
+        * Try running a different beta branch. (in case the issue is already fixed in the future update, or to confirm it is a regression)
+        * Try verifying your game file integrity in Steam before reporting an issue.
+        * Please also test your issue without any addons to confirm the bug is not causing by an addon.
+  - type: textarea
+    id: the-report
+    attributes:
+      label: Details
+      description: |
+        Tell us exactly what happens here, every single detail that you can think of.  
+        Please include information such as the console log if possible (opened in-game by pressing SHIFT+ESC)
+      placeholder: Describe the issue here..
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Please tell us exactly how to reproduce the issue in demand here, step by step.
+      placeholder: Describe how to reproduce the issue here..
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Version of the game
+      description: |
+         Please let us know what version of the game you are running. This info can be retrieved via the `version` console command. (SHIFT+ESC to open the console in-game)  
+      placeholder: Paste the output of the "version" console command here..
+    validations:
+      required: true
+  - type: dropdown
+    id: beta
+    attributes:
+      label: Beta
+      description: What beta version of the game are you using?
+      options:
+        - None/Public/Default/Main
+        - Dev beta
+        - x86-64 beta
+    validations:
+      required: true
