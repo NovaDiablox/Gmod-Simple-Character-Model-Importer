@@ -1386,6 +1386,7 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
         "gmod": gmod,
         "inputs": discovered,
         "rows": jiggle_rows,
+        "bodygroups": default_bodygroup_rows(step9_dir) if step9_dir.exists() else [],
         "physics_globals": physics_globals,
         "physics_rows": physics_rows,
         "physics_collision_text_lines": physics_collision_text_lines,
@@ -1543,15 +1544,57 @@ def flex_model_block(name: str, smd: str, vta: Path) -> list[str]:
     return lines
 
 
-def bodygroup_block(name: str, smd: str, optional_blank: bool = True) -> list[str]:
-    lines = [f'$bodygroup "{name}"\n', '{\n', f'\tstudio "{smd}"\n']
-    if optional_blank:
-        lines.append('\tblank\n')
-    lines.append('}\n\n')
+def bodygroup_group_block(name: str, studios: list[str], can_hide: bool = True) -> list[str]:
+    """A `$bodygroup` with one or more switchable `studio` options and an optional
+    hide ("blank") option. Grouping multiple SMDs lets the user switch parts
+    in-game; omitting `blank` makes the bodygroup non-hideable."""
+    lines = [f'$bodygroup "{name}"\n', "{\n"]
+    for smd in studios:
+        lines.append(f'\tstudio "{smd}"\n')
+    if can_hide:
+        lines.append("\tblank\n")
+    lines.append("}\n\n")
     return lines
 
 
-def bodygroup_qc_blocks(source_dir: Path, include_flexes: bool = True) -> list[str]:
+def bodygroup_block(name: str, smd: str, optional_blank: bool = True) -> list[str]:
+    return bodygroup_group_block(name, [smd], optional_blank)
+
+
+def default_bodygroup_rows(step9_dir: Path) -> list[dict[str, Any]]:
+    """Default bodygroup control rows: one per body-part SMD (Physics excluded),
+    Face/Body first then the rest alphabetical. Each part is its own group and
+    hideable, except flex parts (a sibling .vta) which are locked to their own
+    group and non-hideable (they must stay $model blocks for the flexes)."""
+    rows: list[dict[str, Any]] = []
+    ordered: list[Path] = []
+    for special in ("Face.smd", "Body.smd"):
+        if (step9_dir / special).exists():
+            ordered.append(step9_dir / special)
+    for smd in sorted(step9_dir.glob("*.smd"), key=lambda item: natural_key(item.name)):
+        if smd.name in {"Physics.smd", "Face.smd", "Body.smd"}:
+            continue
+        ordered.append(smd)
+    for index, smd in enumerate(ordered, start=1):
+        name = smd.stem
+        has_flex = (step9_dir / f"{name}.vta").exists()
+        rows.append(
+            {
+                "uid": f"bg_{index:03d}",
+                "smd": smd.name,
+                "name": name,
+                "has_flex": has_flex,
+                "group": name,
+                "can_hide": not has_flex,
+            }
+        )
+    return rows
+
+
+def _bodygroup_qc_blocks_scan(source_dir: Path, include_flexes: bool) -> list[str]:
+    """Back-compat default: every SMD is its own hideable bodygroup; flex SMDs
+    (with a .vta) become $model blocks. Used when the plan has no bodygroup
+    config (auto-port, legacy plans)."""
     lines: list[str] = []
     consumed = {"Physics.smd"}
     if (source_dir / "Face.smd").exists():
@@ -1582,6 +1625,75 @@ def bodygroup_qc_blocks(source_dir: Path, include_flexes: bool = True) -> list[s
     return lines
 
 
+def _bodygroup_qc_blocks_from_config(source_dir: Path, include_flexes: bool, bodygroups: list[dict[str, Any]]) -> list[str]:
+    """Emit bodygroups from the step-14 control plan: SMDs sharing a group become
+    one switchable $bodygroup; non-hideable groups omit `blank`. Flex SMDs are
+    always their own $model (never grouped or hidden)."""
+    lines: list[str] = []
+    valid = [row for row in bodygroups if isinstance(row, dict) and str(row.get("smd") or "")]
+    flex_names = {
+        str(row.get("name") or Path(str(row.get("smd"))).stem)
+        for row in valid
+        if bool(row.get("has_flex")) and (source_dir / f"{Path(str(row.get('smd'))).stem}.vta").exists()
+    }
+    order: list[str] = []
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in valid:
+        smd = str(row.get("smd"))
+        if not (source_dir / smd).exists():
+            continue
+        name = str(row.get("name") or Path(smd).stem)
+        has_flex = bool(row.get("has_flex")) and (source_dir / f"{Path(smd).stem}.vta").exists()
+        if has_flex:
+            group = name  # flex parts can never be grouped
+        else:
+            group = str(row.get("group") or name).strip() or name
+            if group in flex_names:  # never merge a part into a flex part's group
+                group = name
+        member = {"smd": smd, "name": name, "has_flex": has_flex, "can_hide": bool(row.get("can_hide", True))}
+        if group not in groups:
+            groups[group] = []
+            order.append(group)
+        groups[group].append(member)
+    covered = {member["smd"] for members in groups.values() for member in members}
+    for group in order:
+        members = groups[group]
+        for member in (m for m in members if m["has_flex"]):
+            stem = Path(member["smd"]).stem
+            vta = source_dir / f"{stem}.vta"
+            if include_flexes and vta.exists():
+                lines.extend(flex_model_block(stem, member["smd"], vta))
+            else:
+                lines.extend(bodygroup_group_block(member["name"], [member["smd"]], False))
+        nonflex = [m for m in members if not m["has_flex"]]
+        if nonflex:
+            # Show the part whose name matches the group first (the default option),
+            # then the rest in their listed order.
+            anchor = [m for m in nonflex if m["name"] == group]
+            rest = [m for m in nonflex if m["name"] != group]
+            studios = [m["smd"] for m in anchor + rest]
+            can_hide = all(bool(m["can_hide"]) for m in nonflex)
+            lines.extend(bodygroup_group_block(group, studios, can_hide))
+    # Any SMD present on disk but absent from the config (e.g. re-exported with a
+    # new part) falls back to its own hideable bodygroup so nothing is dropped.
+    for smd in sorted(source_dir.glob("*.smd"), key=lambda item: natural_key(item.name)):
+        if smd.name in covered or smd.name == "Physics.smd":
+            continue
+        stem = smd.stem
+        vta = source_dir / f"{stem}.vta"
+        if include_flexes and vta.exists():
+            lines.extend(flex_model_block(stem, smd.name, vta))
+        else:
+            lines.extend(bodygroup_block(stem, smd.name))
+    return lines
+
+
+def bodygroup_qc_blocks(source_dir: Path, include_flexes: bool = True, bodygroups: list[dict[str, Any]] | None = None) -> list[str]:
+    if bodygroups:
+        return _bodygroup_qc_blocks_from_config(source_dir, include_flexes, bodygroups)
+    return _bodygroup_qc_blocks_scan(source_dir, include_flexes)
+
+
 def base_qc_lines(
     plan: dict[str, Any],
     source_dir: Path,
@@ -1595,7 +1707,8 @@ def base_qc_lines(
     lines: list[str] = []
     lines.append('// Created by MMD Character Importer Step 14\n\n')
     lines.extend(qc_model_header(plan, pm=pm))
-    lines.extend(bodygroup_qc_blocks(source_dir, include_flexes=include_flexes))
+    bodygroups = plan.get("bodygroups") if isinstance(plan.get("bodygroups"), list) else None
+    lines.extend(bodygroup_qc_blocks(source_dir, include_flexes=include_flexes, bodygroups=bodygroups))
     lines.append('$surfaceprop "flesh" \n\n')
     lines.append('$contents "solid" \n\n')
     lines.append("$illumposition -0.637 0 35.954 \n\n")

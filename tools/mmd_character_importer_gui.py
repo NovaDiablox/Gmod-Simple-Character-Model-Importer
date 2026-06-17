@@ -3396,6 +3396,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._updating_qc_table = False
         self._updating_qc_jiggle_controls = False
         self._updating_qc_physics_table = False
+        self._updating_qc_bodygroup_table = False
         self._selected_qc_physics_row = -1
         self.pmx_paths: list[Path] = []
 
@@ -8562,7 +8563,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         bone_layout.addWidget(self.qc_bone_table, 1)
 
         self.qc_advanced_toggle = QtWidgets.QToolButton()
-        self.qc_advanced_toggle.setText("Show Advanced Jiggle / Physics Controls")
+        self.qc_advanced_toggle.setText("Show Advanced Jiggle / Physics / Bodygroup Controls")
         self.qc_advanced_toggle.setCheckable(True)
         self.qc_advanced_toggle.setChecked(False)
         self.qc_advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -8693,6 +8694,33 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_reset_physics_button = QtWidgets.QPushButton("Reload analyzed physics defaults")
         physics_layout.addWidget(self.qc_reset_physics_button, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         self.qc_advanced_panel.addTab(physics_tab, "Physics Constraints")
+
+        bodygroup_tab = QtWidgets.QWidget()
+        bodygroup_layout = QtWidgets.QVBoxLayout(bodygroup_tab)
+        bodygroup_layout.setContentsMargins(6, 6, 6, 6)
+        bodygroup_hint = QtWidgets.QLabel(
+            "Control how body parts become in-game bodygroups. Set two or more parts to the same Group to make "
+            "them switchable options under one bodygroup (the part matching the group name is shown by default). "
+            "Untick Can Hide to drop the 'blank' (hidden) option so a bodygroup is always shown. Face/Body and any "
+            "part with a .vta (shapekey/flex) are locked: they stay their own bodygroup and cannot be grouped or hidden."
+        )
+        bodygroup_hint.setObjectName("fieldHint")
+        bodygroup_hint.setWordWrap(True)
+        bodygroup_layout.addWidget(bodygroup_hint)
+        self.qc_bodygroup_table = QtWidgets.QTableWidget(0, 4)
+        self.qc_bodygroup_table.setHorizontalHeaderLabels(["Part (SMD)", "Group", "Can Hide", "Type"])
+        self.qc_bodygroup_table.verticalHeader().setVisible(False)
+        self.qc_bodygroup_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.qc_bodygroup_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.qc_bodygroup_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.qc_bodygroup_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.qc_bodygroup_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_bodygroup_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        bodygroup_layout.addWidget(self.qc_bodygroup_table, 1)
+        self.qc_reset_bodygroups_button = QtWidgets.QPushButton("Reset bodygroups to defaults")
+        bodygroup_layout.addWidget(self.qc_reset_bodygroups_button, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.qc_advanced_panel.addTab(bodygroup_tab, "Bodygroups")
+
         bone_layout.addWidget(self.qc_advanced_panel, 0)
         table_layout.addWidget(bone_group, 2)
 
@@ -8813,6 +8841,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_set_not_jiggle_button.clicked.connect(lambda: self.set_selected_qc_jiggle_type("Not Jiggle"))
         self.qc_reset_jiggle_params_button.clicked.connect(self.reset_selected_qc_jiggle_params)
         self.qc_reset_physics_button.clicked.connect(self.reload_qc_physics_from_plan_defaults)
+        self.qc_reset_bodygroups_button.clicked.connect(self.reload_qc_bodygroups_from_defaults)
 
         self.tabs.addTab(tab, "14 Sort QC and Compile")
 
@@ -19694,7 +19723,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.qc_advanced_panel.setVisible(visible)
         if hasattr(self, "qc_advanced_toggle"):
             self.qc_advanced_toggle.setText(
-                "Hide Advanced Jiggle / Physics Controls" if visible else "Show Advanced Jiggle / Physics Controls"
+                "Hide Advanced Jiggle / Physics / Bodygroup Controls"
+                if visible
+                else "Show Advanced Jiggle / Physics / Bodygroup Controls"
             )
             icon = QtWidgets.QStyle.StandardPixmap.SP_ArrowDown if visible else QtWidgets.QStyle.StandardPixmap.SP_ArrowForward
             self.qc_advanced_toggle.setIcon(self.style().standardIcon(icon))
@@ -20042,6 +20073,145 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if isinstance(defaults, list):
             self.current_qc_plan["physics_rows"] = deepcopy(defaults)
             self.populate_qc_physics_table()
+            self.update_qc_summary()
+
+    def qc_bodygroup_rows(self) -> list[dict[str, object]]:
+        if not self.current_qc_plan:
+            return []
+        rows = self.current_qc_plan.get("bodygroups", [])
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def qc_bodygroup_entry_for_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.qc_bodygroup_rows():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def populate_qc_bodygroup_table(self) -> None:
+        if not hasattr(self, "qc_bodygroup_table"):
+            return
+        rows = self.qc_bodygroup_rows()
+        if self.current_qc_plan is not None and rows and not isinstance(self.current_qc_plan.get("bodygroups_default"), list):
+            self.current_qc_plan["bodygroups_default"] = deepcopy(rows)
+        # Candidate group names: every non-flex part can serve as a group target.
+        group_options = sorted({str(row.get("name") or "") for row in rows if not bool(row.get("has_flex"))})
+        self._updating_qc_bodygroup_table = True
+        try:
+            table = self.qc_bodygroup_table
+            table.setRowCount(len(rows))
+            for row_index, entry in enumerate(rows):
+                uid = str(entry.get("uid") or "")
+                has_flex = bool(entry.get("has_flex"))
+                name = str(entry.get("name") or "")
+                part_item = QtWidgets.QTableWidgetItem(str(entry.get("smd") or name))
+                part_item.setFlags(part_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                part_item.setToolTip(name)
+                table.setItem(row_index, 0, part_item)
+
+                if has_flex:
+                    group_item = QtWidgets.QTableWidgetItem(name)
+                    group_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+                    group_item.setToolTip("Flex part (has a .vta) — locked to its own bodygroup.")
+                    table.setItem(row_index, 1, group_item)
+                    table.removeCellWidget(row_index, 1)
+                else:
+                    combo = QtWidgets.QComboBox()
+                    combo.setEditable(True)
+                    combo.addItems(group_options)
+                    combo.setCurrentText(str(entry.get("group") or name) or name)
+                    combo.setProperty("bg_uid", uid)
+                    combo.setToolTip("Set this to another part's name to switch them under one bodygroup.")
+                    combo.currentTextChanged.connect(self.on_qc_bodygroup_group_changed)
+                    table.setCellWidget(row_index, 1, combo)
+
+                hide_widget = QtWidgets.QWidget()
+                hide_layout = QtWidgets.QHBoxLayout(hide_widget)
+                hide_layout.setContentsMargins(0, 0, 0, 0)
+                hide_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                hide_check = QtWidgets.QCheckBox()
+                hide_check.setChecked(bool(entry.get("can_hide", True)) and not has_flex)
+                hide_check.setEnabled(not has_flex)
+                hide_check.setProperty("bg_uid", uid)
+                hide_check.setToolTip(
+                    "Flex parts can never be hidden." if has_flex else "Untick to always show this bodygroup (no 'blank' option)."
+                )
+                hide_check.toggled.connect(self.on_qc_bodygroup_hide_changed)
+                hide_layout.addWidget(hide_check)
+                table.setCellWidget(row_index, 2, hide_widget)
+
+                type_item = QtWidgets.QTableWidgetItem("Flex (locked)" if has_flex else "Bodygroup")
+                type_item.setFlags(type_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                table.setItem(row_index, 3, type_item)
+            table.resizeColumnsToContents()
+        finally:
+            self._updating_qc_bodygroup_table = False
+
+    def on_qc_bodygroup_group_changed(self, text: str) -> None:
+        if self._updating_qc_bodygroup_table:
+            return
+        combo = self.sender()
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return
+        entry = self.qc_bodygroup_entry_for_uid(str(combo.property("bg_uid") or ""))
+        if not entry or bool(entry.get("has_flex")):
+            return
+        new_group = str(text or "").strip() or str(entry.get("name") or "")
+        # Disallow grouping into a flex part's name (flex parts are $model blocks).
+        flex_names = {str(r.get("name") or "") for r in self.qc_bodygroup_rows() if bool(r.get("has_flex"))}
+        if new_group in flex_names:
+            new_group = str(entry.get("name") or "")
+        entry["group"] = new_group
+        self._qc_plan_user_modified = True
+        self.update_qc_summary()
+
+    def on_qc_bodygroup_hide_changed(self, checked: bool) -> None:
+        if self._updating_qc_bodygroup_table:
+            return
+        check = self.sender()
+        if not isinstance(check, QtWidgets.QCheckBox):
+            return
+        entry = self.qc_bodygroup_entry_for_uid(str(check.property("bg_uid") or ""))
+        if not entry or bool(entry.get("has_flex")):
+            return
+        entry["can_hide"] = bool(checked)
+        # A bodygroup's hide option is shared by all parts grouped under it; keep
+        # grouped members in sync so the emitted "blank" is unambiguous.
+        group = str(entry.get("group") or entry.get("name") or "")
+        member_uids = {
+            str(r.get("uid") or "")
+            for r in self.qc_bodygroup_rows()
+            if not bool(r.get("has_flex")) and str(r.get("group") or r.get("name")) == group
+        }
+        if len(member_uids) > 1:
+            for r in self.qc_bodygroup_rows():
+                if str(r.get("uid") or "") in member_uids:
+                    r["can_hide"] = bool(checked)
+            self._sync_bodygroup_hide_checks(member_uids, bool(checked))
+        self._qc_plan_user_modified = True
+        self.update_qc_summary()
+
+    def _sync_bodygroup_hide_checks(self, uids: set[str], checked: bool) -> None:
+        table = self.qc_bodygroup_table
+        self._updating_qc_bodygroup_table = True
+        try:
+            for row in range(table.rowCount()):
+                widget = table.cellWidget(row, 2)
+                if widget is None:
+                    continue
+                check = widget.findChild(QtWidgets.QCheckBox)
+                if check is not None and str(check.property("bg_uid") or "") in uids:
+                    check.setChecked(checked)
+        finally:
+            self._updating_qc_bodygroup_table = False
+
+    def reload_qc_bodygroups_from_defaults(self) -> None:
+        if not self.current_qc_plan:
+            return
+        defaults = self.current_qc_plan.get("bodygroups_default")
+        if isinstance(defaults, list):
+            self.current_qc_plan["bodygroups"] = deepcopy(defaults)
+            self._qc_plan_user_modified = True
+            self.populate_qc_bodygroup_table()
             self.update_qc_summary()
 
     def qc_safe_text(self, text: str, fallback: str = "") -> str:
@@ -20418,6 +20588,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._updating_qc_table = False
         self.qc_bone_table.resizeRowsToContents()
         self.populate_qc_physics_table()
+        self.populate_qc_bodygroup_table()
         self.sync_qc_jiggle_controls_from_selection()
         self.update_qc_filter_status()
 
