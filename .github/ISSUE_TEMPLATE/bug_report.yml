@@ -1,13 +1,13 @@
-name: "Bug report"
+name: "Report an Issue"
 description: "Create a bug report to help us improve the GModSCMI"
 body:
   - type: markdown
     attributes:
       value: |
         Before reporting an issue, please do the following:
-        * Try running a different beta branch. (in case the issue is already fixed in the future update, or to confirm it is a regression)
-        * Try verifying your game file integrity in Steam before reporting an issue.
-        * Please also test your issue without any addons to confirm the bug is not causing by an addon.
+        * Try to whitelist the importer program.
+        * Try verifying your Garry's Mod file integrity on Steam.
+        * Try to use the provided Jigglebone and Material tools in game to fix common issues. 
   - type: textarea
     id: the-report
     attributes:
@@ -15,18 +15,18 @@ body:
       description: |
         Tell us exactly what happens here, every single detail that you can think of.  
         Please include information such as the console log if possible.
-      placeholder: Describe the issue here..
+      placeholder: Paste the error log here..
     validations:
       required: true
   - type: textarea
-    id: reproduction
+    id: model-file
     attributes:
-      label: Steps to reproduce
+      label: Original Model File Which Caused the Error
       description: |
-        Please tell us exactly how to reproduce the issue in demand here, step by step.
-      placeholder: Describe how to reproduce the issue here..
+        Please provide the model file if possible.
+      placeholder: Please upload a .zip file containing your model.
     validations:
-      required: true
+      required: false
   - type: textarea
     id: version
     attributes:
@@ -35,26 +35,26 @@ body:
          Please let us know what version of the game you are running. This info can be retrieved via the `version` console command. (SHIFT+ESC to open the console in-game)  
       placeholder: Paste the output of the "version" console command here..
     validations:
-      required: true
+      required: false
   - type: dropdown
     id: beta
     attributes:
       label: Beta
-      description: What beta version of the game are you using?
+      description: What beta version of the game are you using? Ignore this if you have no idea.
       options:
         - None/Public/Default/Main
-        - Dev beta
         - x86-64 beta
+        - Dev beta
     validations:
-      required: true
-
+      required: false
       type: dropdown
     id: OS
     attributes:
       label: OS
       description: What OS are you using?
       options:
-        - Windows 10
         - Windows 11
+        - Any Linux / Ubuntu
+        - Windows 10
     validations:
-      required: true
+      required: false
