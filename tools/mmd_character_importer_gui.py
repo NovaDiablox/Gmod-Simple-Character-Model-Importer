@@ -3383,6 +3383,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._hover_vrd_uid = ""
         self._vrd_entries_by_uid: dict[str, dict[str, object]] = {}
         self._last_vrd_preview_state: tuple[str, frozenset[str], str, frozenset[str]] | None = None
+        # Coalesce the (heavy) VRD preview re-blend so dragging the intensity or
+        # frame sliders fires one rebuild after the drag settles, not one per tick.
+        self._vrd_preview_refresh_timer: QtCore.QTimer | None = None
+        self._vrd_bone_overlay_ref: object | None = None
         self._hover_texture_uid = ""
         self._hover_icon_file = ""
         self._hover_qc_bone_uid = ""
@@ -8161,6 +8165,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.vrd_tab = tab
         tab_layout = QtWidgets.QVBoxLayout(tab)
 
+        # Debounce timer shared by the intensity and frame sliders: each value
+        # change restarts the countdown, so the expensive blended-mesh rebuild
+        # runs once the user stops dragging instead of on every intermediate tick.
+        self._vrd_preview_refresh_timer = QtCore.QTimer(self)
+        self._vrd_preview_refresh_timer.setSingleShot(True)
+        self._vrd_preview_refresh_timer.setInterval(80)
+        self._vrd_preview_refresh_timer.timeout.connect(self.refresh_vrd_preview)
+
         self.vrd_input_row = PathRow(
             "Step 9 export folder",
             "dir",
@@ -8247,6 +8259,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.vrd_frame_slider.setRange(0, 3)
             self.vrd_frame_slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
             self.vrd_frame_slider.setTickInterval(1)
+            # A groove click pages by one frame (not a big jump), so the
+            # four-position slider is easy to land precisely.
+            self.vrd_frame_slider.setSingleStep(1)
+            self.vrd_frame_slider.setPageStep(1)
             self.vrd_frame_label = QtWidgets.QLabel("0")
             frame_layout.addWidget(self.vrd_frame_slider, 1)
             frame_layout.addWidget(self.vrd_frame_label)
@@ -18338,14 +18354,23 @@ class ImporterWindow(QtWidgets.QMainWindow):
             multipliers[str(frame)] = max(0.0, min(2.0, float(value)))
         self.current_vrd_plan["intensity_multipliers"] = multipliers
 
+    def schedule_vrd_preview_refresh(self) -> None:
+        """Debounce the heavy blended-mesh preview rebuild driven by the sliders."""
+        timer = self._vrd_preview_refresh_timer
+        if timer is None:
+            self.refresh_vrd_preview()
+            return
+        timer.start()
+
     def on_vrd_intensity_changed(self, frame: int, value: int) -> None:
         label = getattr(self, "vrd_intensity_value_labels", {}).get(frame)
         if label:
             label.setText(f"{max(0.0, min(2.0, value / 100.0)):.2f}x")
         if self._updating_vrd_intensity_controls:
             return
+        # The plan multiplier (cheap) is updated live; the mesh re-blend is debounced.
         self.update_vrd_plan_intensity_from_controls()
-        self.refresh_vrd_preview()
+        self.schedule_vrd_preview_refresh()
 
     def vrd_entries(self) -> list[dict[str, object]]:
         if not self.current_vrd_plan:
@@ -18658,7 +18683,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def on_vrd_frame_changed(self, index: int) -> None:
         frame = [0, 10, 20, 30][max(0, min(3, int(index)))]
         self.vrd_frame_label.setText(str(frame))
-        self.refresh_vrd_preview()
+        # Debounced so dragging across the four frames stays smooth.
+        self.schedule_vrd_preview_refresh()
 
     def vrd_preview_frame_payload(self, key: str, frame: int) -> dict[str, object]:
         if not self.current_vrd_preview:
@@ -18782,8 +18808,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
         else:
             self.vrd_preview.set_material_data(scan, {})
         if hasattr(self.vrd_preview, "set_bone_overlay"):
+            # The rest-armature overlay is static across frame/intensity changes;
+            # only rebuild it when a new preview payload is loaded.
             bone_preview = self.current_vrd_preview.get("bone_preview", {})
-            self.vrd_preview.set_bone_overlay(bone_preview if isinstance(bone_preview, dict) else {})
+            if bone_preview is not self._vrd_bone_overlay_ref:
+                self._vrd_bone_overlay_ref = bone_preview
+                self.vrd_preview.set_bone_overlay(bone_preview if isinstance(bone_preview, dict) else {})
         self._last_vrd_preview_state = None
         self.refresh_vrd_preview_overlay()
         self.refresh_vrd_preview_state()

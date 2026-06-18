@@ -36,7 +36,7 @@ SHRINK_PRESENTATION_OFFSET = 0.12
 COACD_MAX_VERTICES = 64
 COACD_THRESHOLD = 0.08
 COACD_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MMDCharacterImporter" / "software" / "coacd_wheels"
-COACD_RESULT_CACHE_VERSION = 2
+COACD_RESULT_CACHE_VERSION = 3
 EXCLUDED_SOURCE_OBJECT_TOKENS = (
     "physics",
 )
@@ -1275,6 +1275,42 @@ def is_descendant_of(bone: bpy.types.Bone, ancestor_name: str) -> bool:
     return False
 
 
+def is_pose_correction_bone(name: str, essential: set[str]) -> bool:
+    """A non-essential pose-correction helper bone (3ds Max Biped twist/pose bones
+    like Bip001RForeTwist1, Bip_Leg_L_F, HandTwist_R_001) whose weights belong to
+    its parent essential bone for collision. Essential ValveBiped target bones and
+    the renamed ValveBiped.* intermediates are excluded (those are handled by the
+    explicit influence rules)."""
+    if name in essential:
+        return False
+    lower = name.lower()
+    if lower.startswith("valvebiped."):
+        return False
+    return "bip" in lower or "twist" in lower
+
+
+def pose_correction_descendants(armature: bpy.types.Object, bone_name: str, essential: set[str]) -> list[str]:
+    """Pose-correction helper bones whose chain up to ``bone_name`` passes only
+    through other pose-correction helpers — i.e. a direct child of this essential
+    bone, or a direct child of such a helper. Their weight regions fold into this
+    bone's collision hull so twist/pose bones no longer leave gaps. The walk stops
+    at the next essential bone (another collision target owns it) and at any
+    non-helper soft bone (hair/skirt/accessory, which keep their own collision)."""
+    root = armature.data.bones.get(bone_name)
+    if root is None:
+        return []
+    folded: list[str] = []
+    stack = list(root.children)
+    while stack:
+        bone = stack.pop()
+        if bone.name in essential:
+            continue
+        if is_pose_correction_bone(bone.name, essential):
+            folded.append(bone.name)
+            stack.extend(bone.children)
+    return folded
+
+
 def collision_influence_bones(armature: bpy.types.Object, bone_name: str) -> list[str]:
     names: list[str] = []
 
@@ -1318,6 +1354,11 @@ def collision_influence_bones(armature: bpy.types.Object, bone_name: str) -> lis
                 and is_descendant_of(bone, bone_name)
             ):
                 add(bone.name)
+    # Fold non-essential pose-correction helper bones (twist/Bip pose bones) that
+    # hang off this essential bone into its collision hull so they stop leaving
+    # gaps that need manual correction.
+    for folded in pose_correction_descendants(armature, bone_name, set(DEFAULT_TARGET_BONES)):
+        add(folded)
     return names
 
 
@@ -2169,6 +2210,7 @@ def run_coacd_single_hull(
     shrink: float,
     bone_name: str = "",
     cache_key: str = "",
+    extra_points: list[Vector] | None = None,
 ) -> tuple[list[Vector], list[tuple[int, int, int]], dict[str, object], list[str]]:
     warnings: list[str] = []
     started = time.monotonic()
@@ -2223,6 +2265,11 @@ def run_coacd_single_hull(
         center = sum(mesh_vertices, Vector((0.0, 0.0, 0.0))) / float(len(mesh_vertices))
         shrink = max(0.25, min(1.25, float(shrink)))
         shrunken = [center + (vertex - center) * shrink for vertex in mesh_vertices]
+        if extra_points:
+            # Joint-anchor disc points are already at their final positions/size, so
+            # they are added after the shrink step (not shrunk, not part of the
+            # centroid) — they only ever extend the hull to reach the shared joint.
+            shrunken.extend(point.copy() for point in extra_points)
         hull_vertices, hull_faces = convex_hull_from_points(shrunken)
         if hull_vertices and len(hull_vertices) > max_ch_vertex:
             reduced = limit_hull_vertices(hull_vertices, max_ch_vertex)
@@ -2337,13 +2384,16 @@ def make_coacd_region_geometry(
     region: dict[str, object],
     shrink: float,
     cache_key: str = "",
+    extra_points: list[Vector] | None = None,
 ) -> tuple[list[Vector], list[tuple[int, int, int]], list[dict[str, object]], dict[str, object], list[str]]:
     warnings: list[str] = []
     vertices = region.get("vertices", [])
     faces = region.get("faces", [])
     if not isinstance(vertices, list) or not isinstance(faces, list) or len(vertices) < MIN_MULTI_HULL_POINTS or len(faces) < 8:
         return [], [], [], {"coverage_score": 0.0, "hull_piece_count": 0}, ["CoACD fallback used because the weight-region mesh was sparse."]
-    hull_vertices, hull_faces, status, coacd_warnings = run_coacd_single_hull(vertices, faces, shrink, bone_name=bone_name, cache_key=cache_key)
+    hull_vertices, hull_faces, status, coacd_warnings = run_coacd_single_hull(
+        vertices, faces, shrink, bone_name=bone_name, cache_key=cache_key, extra_points=extra_points
+    )
     warnings.extend(coacd_warnings)
     if not hull_vertices or not hull_faces:
         return [], [], [], {"coverage_score": 0.0, "coacd": status, "hull_piece_count": 0}, warnings
@@ -2477,6 +2527,75 @@ def direct_target_children(armature: bpy.types.Object, bone_name: str, target_bo
         return []
     target_set = set(str(item) for item in (target_bones or TARGET_BONES))
     return [child.name for child in bone.children if child.name in target_set]
+
+
+def joint_anchor_discs(
+    armature: bpy.types.Object,
+    bone_name: str,
+    fit: dict[str, object],
+    clouds: dict[str, list[Vector]],
+    target_names: Iterable[str],
+    shrink: float,
+    segments: int = 12,
+) -> list[Vector]:
+    """Synthetic disc(s) of points at the geometric joint shared with each adjacent
+    target neighbour (parent or child), to be added to the convex hull AFTER shrink
+    so the hull reliably reaches the joint.
+
+    Both adjacent bones derive the SAME world-space joint centre — the midpoint of
+    the two weight clouds' facing edges — and a matching radius, so their hulls
+    overlap at the joint instead of leaving a gap the in-game collision passes
+    through (the Thigh/Calf knee gap). Because the points are appended after the
+    shrink step they do not move the region centroid or get shrunk away, and the
+    radius is taken from the local cross-section so the disc stays inside the limb.
+    """
+    my_cloud = clouds.get(bone_name, [])
+    if len(my_cloud) < 12:
+        return []
+    bone = armature.data.bones.get(bone_name)
+    if bone is None:
+        return []
+    target_set = set(str(name) for name in target_names)
+    neighbours = list(direct_target_children(armature, bone_name, target_names))
+    if bone.parent is not None and bone.parent.name in target_set:
+        neighbours.append(bone.parent.name)
+    if not neighbours:
+        return []
+    my_centroid = sum(my_cloud, Vector((0.0, 0.0, 0.0))) / float(len(my_cloud))
+    anchor: list[Vector] = []
+    for neighbour in neighbours:
+        nb_cloud = clouds.get(neighbour, [])
+        if len(nb_cloud) < 12:
+            continue
+        nb_centroid = sum(nb_cloud, Vector((0.0, 0.0, 0.0))) / float(len(nb_cloud))
+        axis = nb_centroid - my_centroid
+        if axis.length < 1e-5:
+            continue
+        axis = axis.normalized()
+        my_edge_pts = sorted(my_cloud, key=lambda point: (point - my_centroid).dot(axis))[-max(8, len(my_cloud) // 25):]
+        nb_edge_pts = sorted(nb_cloud, key=lambda point: (point - nb_centroid).dot(-axis))[-max(8, len(nb_cloud) // 25):]
+        my_edge = sum(my_edge_pts, Vector((0.0, 0.0, 0.0))) / float(len(my_edge_pts))
+        nb_edge = sum(nb_edge_pts, Vector((0.0, 0.0, 0.0))) / float(len(nb_edge_pts))
+        joint_center = (my_edge + nb_edge) * 0.5
+
+        def perp_radius(points: list[Vector], origin: Vector) -> float:
+            radii: list[float] = []
+            for point in points:
+                delta = point - origin
+                radii.append((delta - axis * delta.dot(axis)).length)
+            return percentile(sorted(radii), 0.75) if radii else 0.0
+
+        radius = max(perp_radius(my_edge_pts, my_edge), perp_radius(nb_edge_pts, nb_edge)) * float(shrink)
+        if radius <= 1e-4:
+            continue
+        helper = Vector((0.0, 0.0, 1.0)) if abs(axis.z) < 0.9 else Vector((1.0, 0.0, 0.0))
+        u_axis = axis.cross(helper).normalized()
+        v_axis = axis.cross(u_axis).normalized()
+        for index in range(segments):
+            angle = math.tau * index / segments
+            anchor.append(joint_center + u_axis * (math.cos(angle) * radius) + v_axis * (math.sin(angle) * radius))
+        anchor.append(joint_center.copy())
+    return anchor
 
 
 def median(values: list[float]) -> float:
@@ -2750,6 +2869,7 @@ def collision_part_cache_key(
             "selected_vertex_count": int(region.get("selected_vertex_count", 0) or 0),
             "selected_face_count": int(region.get("selected_face_count", 0) or 0),
             "child_face_count": int(region.get("child_face_count", 0) or 0),
+            "joint_anchor_count": int(region.get("joint_anchor_count", 0) or 0),
         }
     )
 
@@ -2856,8 +2976,16 @@ def build_collision_parts(
                 f"{int(region.get('selected_face_count', 0) or 0):,} faces."
             )
         coacd_started = time.monotonic()
+        # Anchor discs at shared joints with adjacent target bones close the gaps
+        # between neighbouring limb hulls (e.g. the Thigh/Calf knee).
+        anchor_points = joint_anchor_discs(armature, bone_name, fit, clouds, target_names, shrink)
+        region["joint_anchor_count"] = len(anchor_points)
         cache_key = collision_part_cache_key(input_blend, bone_name, shrink, source_index, region)
-        vertices, faces, hulls, metrics, multi_warnings = make_coacd_region_geometry(armature, bone_name, region, shrink, cache_key=cache_key)
+        vertices, faces, hulls, metrics, multi_warnings = make_coacd_region_geometry(
+            armature, bone_name, region, shrink, cache_key=cache_key, extra_points=anchor_points
+        )
+        if anchor_points:
+            log_progress(f"{bone_name}: added {len(anchor_points)} joint-anchor points to bridge adjacent collision hulls.")
         bone_timing["coacd_seconds"] = timing_entry(coacd_started)
         method = "coacd_single_hull_weight_region"
         shape_type = "coacd_single_hull"

@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import bpy
+import numpy as np
 from mathutils import Matrix, Quaternion, Vector
 
 
@@ -423,12 +424,40 @@ def collect_preview(
         try:
             uv_layer = mesh.uv_layers.active
             material_slots = obj.data.materials
-            for poly in mesh.polygons:
-                mat = material_slots[int(poly.material_index)] if 0 <= int(poly.material_index) < len(material_slots) else None
+            slot_count = len(material_slots)
+            # World-space vertex positions in one vectorized pass instead of a
+            # per-vertex ``matrix_world @ co`` (this preview is collected 7-8x per
+            # Step 11 run across four frames). Mirrors blender_sort_flexes.py;
+            # np.round(.., 6) matches the previous v3() rounding.
+            vert_count = len(mesh.vertices)
+            co_buffer = np.empty(vert_count * 3, dtype=np.float32)
+            mesh.vertices.foreach_get("co", co_buffer)
+            world_matrix = np.array(eval_obj.matrix_world, dtype=np.float64)
+            world_coords = np.round(
+                co_buffer.astype(np.float64).reshape((vert_count, 3)) @ world_matrix[:3, :3].T + world_matrix[:3, 3],
+                6,
+            )
+            uv_coords: np.ndarray | None = None
+            if uv_layer is not None:
+                uv_count = len(uv_layer.data)
+                uv_buffer = np.empty(uv_count * 2, dtype=np.float32)
+                uv_layer.data.foreach_get("uv", uv_buffer)
+                uv_coords = np.round(uv_buffer.astype(np.float64).reshape((uv_count, 2)), 6)
+            obj_fragment = safe_fragment(obj.name)
+            # Resolve material uid/name/texture once per slot, not per polygon
+            # (avoids a regex and a material node-tree walk on every face).
+            material_info_by_index: dict[int, str] = {}
+
+            def material_uid_for(material_index: int) -> str:
+                cached = material_info_by_index.get(material_index)
+                if cached is not None:
+                    return cached
+                mat = material_slots[material_index] if 0 <= material_index < slot_count else None
                 mat_name = mat.name if mat is not None else "No_Material"
-                material_uid = f"{safe_fragment(obj.name)}__{int(poly.material_index):03d}_{safe_fragment(mat_name)}"
-                texture_path = material_texture_path(mat, texture_by_name)
+                material_uid = f"{obj_fragment}__{material_index:03d}_{safe_fragment(mat_name)}"
+                material_info_by_index[material_index] = material_uid
                 if material_uid not in materials_by_uid:
+                    texture_path = material_texture_path(mat, texture_by_name)
                     materials_by_uid[material_uid] = {
                         "uid": material_uid,
                         "material_name": f"{obj.name} / {mat_name}",
@@ -440,6 +469,10 @@ def collect_preview(
                         "base_color_file": Path(texture_path).name if texture_path else "",
                         "alpha": 1.0,
                     }
+                return material_uid
+
+            for poly in mesh.polygons:
+                material_uid = material_uid_for(int(poly.material_index))
                 verts = list(poly.vertices)
                 loops = list(poly.loop_indices)
                 if len(verts) < 3:
@@ -448,12 +481,11 @@ def collect_preview(
                     if triangle_index % stride == 0:
                         vertex_indices = [verts[0], verts[offset], verts[offset + 1]]
                         loop_indices = [loops[0], loops[offset], loops[offset + 1]]
-                        coords = [v3(eval_obj.matrix_world @ mesh.vertices[index].co) for index in vertex_indices]
+                        coords = [world_coords[index].tolist() for index in vertex_indices]
                         uvs: list[list[float]] = []
                         for loop_index in loop_indices:
-                            if uv_layer is not None and 0 <= loop_index < len(uv_layer.data):
-                                uv = uv_layer.data[loop_index].uv
-                                uvs.append([round(float(uv.x), 6), round(float(uv.y), 6)])
+                            if uv_coords is not None and 0 <= loop_index < len(uv_coords):
+                                uvs.append(uv_coords[loop_index].tolist())
                             else:
                                 uvs.append([0.0, 0.0])
                         points.extend(coords)
@@ -1383,9 +1415,14 @@ def build_vrd_preview(
     driver_frame_previews: dict[str, dict[str, object]] | None = None,
     driver_overlays: dict[str, dict[str, object]] | None = None,
     intensity_multipliers: dict[str, float] | None = None,
+    driver_preview_bundle: tuple[dict[str, dict[str, object]], dict[str, object], list[dict[str, object]], int] | None = None,
 ) -> dict[str, object]:
     log("Building animated VRD preview meshes for frames 0, 10, 20, and 30.")
-    frame_previews, preview, materials, material_count = collect_vrd_frame_previews(input_dir)
+    # Frame 0 is identical with or without procedural keys, so reuse the mesh the
+    # driver-preview pass already extracted instead of evaluating it a second time.
+    frame_previews, preview, materials, material_count = collect_vrd_frame_previews(
+        input_dir, reuse_frame_zero_from=driver_preview_bundle
+    )
     overlays = {str(frame): {"triangles": pose_line_triangles(armature, rows, frame)} for frame in VRD_FRAMES}
     return {
         "version": 1,
@@ -1654,11 +1691,14 @@ def run_analyze(args: argparse.Namespace) -> dict[str, object]:
     if pose_warning:
         validation["warnings"].append(pose_warning)
     intensity_multipliers = normalize_intensity_multipliers({})
-    driver_frame_previews, _driver_preview, _driver_materials, _driver_material_count = collect_vrd_frame_previews(input_dir)
+    driver_bundle = collect_vrd_frame_previews(input_dir)
+    driver_frame_previews = driver_bundle[0]
     driver_overlays = {str(frame): {"triangles": pose_line_triangles(armature, rows, frame)} for frame in VRD_FRAMES}
     apply_procedural_rows_to_action(armature, rows, intensity_multipliers)
     key_all_bones_at_vrd_frames(armature)
-    preview = build_vrd_preview(armature, rows, input_dir, driver_frame_previews, driver_overlays, intensity_multipliers)
+    preview = build_vrd_preview(
+        armature, rows, input_dir, driver_frame_previews, driver_overlays, intensity_multipliers, driver_preview_bundle=driver_bundle
+    )
     workspace_blend = args.workspace_blend.resolve()
     log(f"Saving VRD analysis workspace blend: {workspace_blend}")
     workspace_blend.parent.mkdir(parents=True, exist_ok=True)
@@ -1721,11 +1761,14 @@ def run_apply(args: argparse.Namespace) -> dict[str, object]:
     validation = validate_plan(armature, rows)
     if validation["errors"]:
         raise RuntimeError("VRD plan validation failed: " + "; ".join(str(error) for error in validation["errors"]))
-    driver_frame_previews, _driver_preview, _driver_materials, _driver_material_count = collect_vrd_frame_previews(input_dir)
+    driver_bundle = collect_vrd_frame_previews(input_dir)
+    driver_frame_previews = driver_bundle[0]
     driver_overlays = {str(frame): {"triangles": pose_line_triangles(armature, rows, frame)} for frame in VRD_FRAMES}
     apply_procedural_rows_to_action(armature, rows, intensity_multipliers)
     key_all_bones_at_vrd_frames(armature)
-    preview = build_vrd_preview(armature, rows, input_dir, driver_frame_previews, driver_overlays, intensity_multipliers)
+    preview = build_vrd_preview(
+        armature, rows, input_dir, driver_frame_previews, driver_overlays, intensity_multipliers, driver_preview_bundle=driver_bundle
+    )
     workspace_blend = args.workspace_blend.resolve()
     log(f"Saving VRD workspace blend: {workspace_blend}")
     workspace_blend.parent.mkdir(parents=True, exist_ok=True)
@@ -1798,11 +1841,14 @@ def run_preview(args: argparse.Namespace) -> dict[str, object]:
     write_json(args.plan_json.resolve(), plan)
     if validation["errors"]:
         raise RuntimeError("VRD preview validation failed: " + "; ".join(str(error) for error in validation["errors"]))
-    driver_frame_previews, _driver_preview, _driver_materials, _driver_material_count = collect_vrd_frame_previews(input_dir)
+    driver_bundle = collect_vrd_frame_previews(input_dir)
+    driver_frame_previews = driver_bundle[0]
     driver_overlays = {str(frame): {"triangles": pose_line_triangles(armature, rows, frame)} for frame in VRD_FRAMES}
     apply_procedural_rows_to_action(armature, rows, intensity_multipliers)
     key_all_bones_at_vrd_frames(armature)
-    preview = build_vrd_preview(armature, rows, input_dir, driver_frame_previews, driver_overlays, intensity_multipliers)
+    preview = build_vrd_preview(
+        armature, rows, input_dir, driver_frame_previews, driver_overlays, intensity_multipliers, driver_preview_bundle=driver_bundle
+    )
     report = {
         "version": 1,
         "kind": "sort_vrd_preview",
