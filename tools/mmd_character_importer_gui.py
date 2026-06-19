@@ -15521,9 +15521,19 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "warnings": ["Additive merged flex; source flexes remain unchanged."],
         }
         self.current_flex_plan.setdefault("flexes", []).append(merged)
+        # An additive merge adds one enabled flex while leaving its sources enabled,
+        # so it can push the enabled count over the 94 Source-flex cap. Re-run the
+        # auto-selection so the cap always holds. The merge itself is never trimmed
+        # (merge rows carry the highest keep-priority); at most a low-priority source
+        # loses its redundant standalone copy, which the merge still combines.
+        trimmed = self.auto_mark_excess_flexes_for_removal()
         self.populate_flex_table()
         self.refresh_flex_preview()
         self.update_flex_summary()
+        if trimmed:
+            self.append_flex_log(
+                f"Merged flex added; auto-disabled {trimmed} lowest-priority flex(es) to stay within the 94 Source-flex limit."
+            )
 
     def unique_flex_uid(self) -> str:
         used = {str(entry.get("uid") or "") for entry in self.flex_entries()}
@@ -15591,6 +15601,16 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if not self.current_flex_plan:
             self.show_error("Apply flexes failed", "Run Analyze Flexes first.")
             return
+        # Safety net: guarantee auto-selection caps enabled flexes at 94 no matter
+        # how the live plan was edited (merges, re-enabled rows) before validating,
+        # so a drifted count self-corrects instead of dead-ending on a hard error.
+        capped = self.auto_mark_excess_flexes_for_removal()
+        if capped:
+            self.populate_flex_table()
+            self.update_flex_summary()
+            self.append_flex_log(
+                f"Auto-disabled {capped} lowest-priority flex(es) to stay within the 94 Source-flex limit before applying."
+            )
         errors = self.validate_flex_plan()
         if errors:
             self.show_error("Flex validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
