@@ -34,6 +34,13 @@ body:
       description: |
          Please let us know what version of the game you are running. This info can be retrieved via the `version` console command. (SHIFT+ESC to open the console in-game)  
       placeholder: Paste the output of the "version" console command here..
+        - type: textarea
+    id: program-log
+    attributes:
+      label: Paste GMod SCMI Log Here
+      description: |
+         Logs are the key to solving a problem.
+      placeholder: Copy log by scrolling down and clicking ⓘ then clicking "Copy Log".
     validations:
       required: false
   - type: dropdown
