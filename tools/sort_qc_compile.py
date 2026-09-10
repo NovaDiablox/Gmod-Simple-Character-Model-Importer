@@ -2602,7 +2602,7 @@ def base_qc_lines(
         # stance exactly.
         lines.append('\n')
     else:
-        lines.append('$origin 0 0 -1.50 \n\n')
+        lines.append('$origin 0 0 0 \n\n')
     lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
     if l4d2:
         # L4D2 survivor MULTIPLAYER sequence-index alignment (issue #105). A survivor REPLACEMENT must
